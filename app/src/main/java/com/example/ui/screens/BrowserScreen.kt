@@ -35,6 +35,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -62,7 +64,6 @@ import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.SmartDisplay
 import androidx.compose.material.icons.filled.TravelExplore
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
@@ -70,10 +71,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
@@ -137,6 +136,7 @@ fun BrowserScreen(
     onOpenMediaSheet: () -> Unit,
     onOpenTabsSheet: () -> Unit,
     onOpenShieldSheet: () -> Unit,
+    onOpenSearchEngineSheet: () -> Unit,
     onSelectSearchEngine: (SearchEngine) -> Unit,
     onToggleDesktopMode: () -> Unit,
     onToggleBookmark: () -> Unit,
@@ -165,7 +165,6 @@ fun BrowserScreen(
 
     var fullscreenCustomView by remember { mutableStateOf<View?>(null) }
     var fullscreenCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
-    var showSearchEngineDialog by remember { mutableStateOf(false) }
 
     val callbacks = remember {
         object : WebViewCallbacks {
@@ -373,15 +372,24 @@ fun BrowserScreen(
                                         activeTab.url.startsWith("https://") -> Icons.Default.Lock
                                         else -> Icons.Default.Public
                                     },
-                                    contentDescription = null,
-                                    tint = if (activeTab.url.startsWith("https://") ||
+                                    contentDescription = if (activeTab.isHomeScreen) "Pilih mesin pencari" else null,
+                                    tint = if (activeTab.isHomeScreen ||
+                                        activeTab.url.startsWith("https://") ||
                                         activeTab.url == DemoStreamPage.DEMO_URL
                                     ) {
                                         MaterialTheme.colorScheme.primary
                                     } else {
                                         MaterialTheme.colorScheme.onSurfaceVariant
                                     },
-                                    modifier = Modifier.size(18.dp)
+                                    modifier = Modifier
+                                        .size(20.dp)
+                                        .then(
+                                            if (activeTab.isHomeScreen) {
+                                                Modifier.clickable { onOpenSearchEngineSheet() }
+                                            } else {
+                                                Modifier
+                                            }
+                                        )
                                 )
                                 Spacer(modifier = Modifier.width(8.dp))
 
@@ -528,6 +536,36 @@ fun BrowserScreen(
                                 expanded = showOverflowMenu,
                                 onDismissRequest = { showOverflowMenu = false }
                             ) {
+                                DropdownMenuItem(
+                                    text = { Text("Mesin Pencari: ${searchEngine.displayName}") },
+                                    leadingIcon = { Icon(Icons.Default.TravelExplore, contentDescription = null) },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        onOpenSearchEngineSheet()
+                                    },
+                                    modifier = Modifier.testTag("menu_search_engine")
+                                )
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            if (isAdBlockEnabled) {
+                                                "Perisai AdBlock: Aktif (${activeTab.blockedAdsCount})"
+                                            } else {
+                                                "Perisai AdBlock: Dijeda"
+                                            }
+                                        )
+                                    },
+                                    leadingIcon = {
+                                        Icon(
+                                            if (isAdBlockEnabled) Icons.Default.GppGood else Icons.Default.GppMaybe,
+                                            contentDescription = null
+                                        )
+                                    },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        onOpenShieldSheet()
+                                    }
+                                )
                                 if (!activeTab.isHomeScreen) {
                                     DropdownMenuItem(
                                         text = { Text("Pindai Media Halaman") },
@@ -570,35 +608,6 @@ fun BrowserScreen(
                                         }
                                     )
                                 }
-                                DropdownMenuItem(
-                                    text = {
-                                        Text(
-                                            if (isAdBlockEnabled) {
-                                                "Perisai AdBlock: Aktif (${activeTab.blockedAdsCount})"
-                                            } else {
-                                                "Perisai AdBlock: Dijeda"
-                                            }
-                                        )
-                                    },
-                                    leadingIcon = {
-                                        Icon(
-                                            if (isAdBlockEnabled) Icons.Default.GppGood else Icons.Default.GppMaybe,
-                                            contentDescription = null
-                                        )
-                                    },
-                                    onClick = {
-                                        showOverflowMenu = false
-                                        onOpenShieldSheet()
-                                    }
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("Mesin Pencari: ${searchEngine.displayName}") },
-                                    leadingIcon = { Icon(Icons.Default.TravelExplore, contentDescription = null) },
-                                    onClick = {
-                                        showOverflowMenu = false
-                                        showSearchEngineDialog = true
-                                    }
-                                )
                                 DropdownMenuItem(
                                     text = { Text("Buka Halaman Demo Video") },
                                     leadingIcon = { Icon(Icons.Default.SmartDisplay, contentDescription = null) },
@@ -654,7 +663,8 @@ fun BrowserScreen(
                         onOpenUrl = onNavigate,
                         onOpenDemo = { onNavigate(DemoStreamPage.DEMO_URL) },
                         onOpenShield = onOpenShieldSheet,
-                        onOpenSearchEnginePicker = { showSearchEngineDialog = true }
+                        onOpenSearchEnginePicker = onOpenSearchEngineSheet,
+                        onSelectSearchEngine = onSelectSearchEngine
                     )
                 } else {
                     val activeWebView = remember(activeTab.id) {
@@ -783,48 +793,6 @@ fun BrowserScreen(
                     .background(Color.Black)
             )
         }
-
-        if (showSearchEngineDialog) {
-            AlertDialog(
-                onDismissRequest = { showSearchEngineDialog = false },
-                title = { Text("Pilih Mesin Pencari") },
-                text = {
-                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        SearchEngine.entries.forEach { engine ->
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .clickable {
-                                        onSelectSearchEngine(engine)
-                                        showSearchEngineDialog = false
-                                    }
-                                    .padding(horizontal = 8.dp, vertical = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                RadioButton(
-                                    selected = engine == searchEngine,
-                                    onClick = {
-                                        onSelectSearchEngine(engine)
-                                        showSearchEngineDialog = false
-                                    }
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = engine.displayName,
-                                    style = MaterialTheme.typography.bodyLarge
-                                )
-                            }
-                        }
-                    }
-                },
-                confirmButton = {
-                    TextButton(onClick = { showSearchEngineDialog = false }) {
-                        Text("Tutup")
-                    }
-                }
-            )
-        }
     }
 }
 
@@ -885,7 +853,8 @@ private fun BrowserHomeStartPage(
     onOpenUrl: (String) -> Unit,
     onOpenDemo: () -> Unit,
     onOpenShield: () -> Unit,
-    onOpenSearchEnginePicker: () -> Unit
+    onOpenSearchEnginePicker: () -> Unit,
+    onSelectSearchEngine: (SearchEngine) -> Unit
 ) {
     Box(
         modifier = Modifier
@@ -1010,6 +979,51 @@ private fun BrowserHomeStartPage(
                             style = MaterialTheme.typography.bodyMedium,
                             color = Color.White.copy(alpha = 0.82f)
                         )
+                    }
+                }
+            }
+
+            // Direct 1-Tap Search Engine Selector Strip
+            item {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "Mesin Pencari",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    LazyRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        items(SearchEngine.entries) { engine ->
+                            val selected = engine == searchEngine
+                            Surface(
+                                onClick = { onSelectSearchEngine(engine) },
+                                color = if (selected) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.surfaceContainer
+                                },
+                                contentColor = if (selected) {
+                                    MaterialTheme.colorScheme.onPrimary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurface
+                                },
+                                border = if (selected) {
+                                    null
+                                } else {
+                                    BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                                },
+                                shape = RoundedCornerShape(999.dp),
+                                modifier = Modifier.testTag("home_engine_${engine.id}")
+                            ) {
+                                Text(
+                                    text = engine.displayName,
+                                    style = MaterialTheme.typography.labelLarge,
+                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp)
+                                )
+                            }
+                        }
                     }
                 }
             }

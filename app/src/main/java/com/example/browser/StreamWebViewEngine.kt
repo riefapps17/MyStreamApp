@@ -219,6 +219,8 @@ fun createConfiguredWebView(
             mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
             javaScriptCanOpenWindowsAutomatically = false
             setSupportMultipleWindows(true)
+            // Remove WebView "; wv" token so streaming players & CDNs treat browser as standard Mobile Chrome
+            userAgentString = userAgentString.replace("; wv)", ")").replace("; wv;", ";")
         }
 
         CookieManager.getInstance().setAcceptCookie(true)
@@ -342,9 +344,9 @@ fun createConfiguredWebView(
                 val acceptHeader = request.requestHeaders["Accept"]
                 val rangeHeader = request.requestHeaders["Range"]
                 val secFetchDest = request.requestHeaders["Sec-Fetch-Dest"]
-                val referer = request.requestHeaders["Referer"] ?: currentPageUrlRef.get().orEmpty()
-                val originHeader = request.requestHeaders["Origin"]
-                    ?: MediaSniffer.deriveOriginHeader(referer, currentPageUrlRef.get().orEmpty())
+                val referer = request.requestHeaders["Referer"].orEmpty().ifBlank { currentPageUrlRef.get().orEmpty() }
+                // Preserve exact Origin sent by WebView (avoid forcing a mismatched Origin on non-CORS CDNs)
+                val originHeader = request.requestHeaders["Origin"].orEmpty()
                 val ua = request.requestHeaders["User-Agent"] ?: defaultUserAgent
 
                 if (MediaSniffer.classifyUrl(normalizedUrl, acceptHeader) != null) {

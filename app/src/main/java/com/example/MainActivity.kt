@@ -56,6 +56,7 @@ import com.example.ui.BrowserTabState
 import com.example.ui.MainViewModel
 import com.example.ui.components.AdBlockShieldSheet
 import com.example.ui.components.DetectedMediaSheet
+import com.example.ui.components.SearchEngineSheet
 import com.example.ui.components.TabsSheet
 import com.example.ui.screens.BookmarksHistoryScreen
 import com.example.ui.screens.BrowserScreen
@@ -91,6 +92,7 @@ private fun StreamVaultApp(
     val isMediaSheetOpen by viewModel.isMediaSheetOpen.collectAsStateWithLifecycle()
     val isTabsSheetOpen by viewModel.isTabsSheetOpen.collectAsStateWithLifecycle()
     val isShieldSheetOpen by viewModel.isShieldSheetOpen.collectAsStateWithLifecycle()
+    val isSearchEngineSheetOpen by viewModel.isSearchEngineSheetOpen.collectAsStateWithLifecycle()
     val isAdBlockEnabled by viewModel.isAdBlockEnabled.collectAsStateWithLifecycle()
     val isPopupBlockEnabled by viewModel.isPopupBlockingEnabled.collectAsStateWithLifecycle()
     val totalAdsBlocked by viewModel.totalAdsBlocked.collectAsStateWithLifecycle()
@@ -306,6 +308,7 @@ private fun StreamVaultApp(
                                     onOpenMediaSheet = { viewModel.openMediaSheet() },
                                     onOpenTabsSheet = { viewModel.openTabsSheet() },
                                     onOpenShieldSheet = { viewModel.openShieldSheet() },
+                                    onOpenSearchEngineSheet = { viewModel.openSearchEngineSheet() },
                                     onSelectSearchEngine = { viewModel.setSearchEngine(it) },
                                     onToggleDesktopMode = { viewModel.toggleDesktopMode() },
                                     onToggleBookmark = { viewModel.toggleBookmarkCurrentPage() },
@@ -387,6 +390,14 @@ private fun StreamVaultApp(
                 onToggleAdBlock = { viewModel.toggleAdBlock() },
                 onTogglePopupBlock = { viewModel.togglePopupBlocking() },
                 onReloadPage = { viewModel.reloadOrStopActiveTab() }
+            )
+        }
+
+        if (isSearchEngineSheetOpen) {
+            SearchEngineSheet(
+                selectedEngine = searchEngine,
+                onSelectEngine = { viewModel.setSearchEngine(it) },
+                onDismiss = { viewModel.closeSearchEngineSheet() }
             )
         }
 

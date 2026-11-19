@@ -122,6 +122,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _isShieldSheetOpen = MutableStateFlow(false)
     val isShieldSheetOpen: StateFlow<Boolean> = _isShieldSheetOpen.asStateFlow()
 
+    private val _isSearchEngineSheetOpen = MutableStateFlow(false)
+    val isSearchEngineSheetOpen: StateFlow<Boolean> = _isSearchEngineSheetOpen.asStateFlow()
+
     private val _playerTarget = MutableStateFlow<PlayerTarget?>(null)
     val playerTarget: StateFlow<PlayerTarget?> = _playerTarget.asStateFlow()
 
@@ -200,6 +203,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun closeShieldSheet() {
         _isShieldSheetOpen.value = false
+    }
+
+    fun openSearchEngineSheet() {
+        _isSearchEngineSheetOpen.value = true
+    }
+
+    fun closeSearchEngineSheet() {
+        _isSearchEngineSheetOpen.value = false
     }
 
     fun createNewTab(initialUrl: String? = null) {

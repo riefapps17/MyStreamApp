@@ -7,6 +7,7 @@ import com.example.browser.MediaFormat
 import com.example.browser.MediaSniffer
 import com.example.data.local.SearchEngine
 import com.example.downloader.DashManifestParser
+import com.example.downloader.StreamDownloader
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -50,10 +51,51 @@ class ExampleRobolectricTest {
             MediaFormat.MP4,
             MediaSniffer.classifyUrl("https://video.cdn.net/videoplayback?itag=22&mime=video%2Fmp4")
         )
+        // Disguised .txt HLS playlist once MIME is detected via probe/magic bytes
+        assertEquals(
+            MediaFormat.HLS,
+            MediaSniffer.classifyUrl(
+                "https://embed-cdn.example/hls2/01/master.txt?t=xyz",
+                "application/vnd.apple.mpegurl"
+            )
+        )
 
         assertNull(MediaSniffer.classifyUrl("https://cdn.example.com/app.js"))
         assertNull(MediaSniffer.classifyUrl("https://cdn.example.com/segment_001.ts"))
         assertNull(MediaSniffer.classifyUrl("blob:https://example.com/1234-5678"))
+    }
+
+    @Test
+    fun `detectMimeFromMagicBytes identifies HLS DASH MP4 and WebM`() {
+        assertEquals(
+            "application/vnd.apple.mpegurl",
+            MediaSniffer.detectMimeFromMagicBytes("#EXTM3U\n#EXT-X-VERSION:3\n".toByteArray())
+        )
+        assertEquals(
+            "application/dash+xml",
+            MediaSniffer.detectMimeFromMagicBytes("<?xml version=\"1.0\"?><MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\">".toByteArray())
+        )
+        val mp4Header = byteArrayOf(0x00, 0x00, 0x00, 0x18, 'f'.code.toByte(), 't'.code.toByte(), 'y'.code.toByte(), 'p'.code.toByte(), 'i'.code.toByte(), 's'.code.toByte(), 'o'.code.toByte(), 'm'.code.toByte())
+        assertEquals("video/mp4", MediaSniffer.detectMimeFromMagicBytes(mp4Header))
+
+        val webmHeader = byteArrayOf(0x1A.toByte(), 0x45.toByte(), 0xDF.toByte(), 0xA3.toByte(), 0x01, 0x00)
+        assertEquals("video/webm", MediaSniffer.detectMimeFromMagicBytes(webmHeader))
+
+        assertNull(MediaSniffer.detectMimeFromMagicBytes("<!DOCTYPE html><html><body>403</body></html>".toByteArray()))
+    }
+
+    @Test
+    fun `stripCloakedTsPrefix strips fake PNG prefix before MPEG-TS sync byte`() {
+        val fakePngPrefix = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+        val tsPayload = ByteArray(376) { 0x11 }
+        tsPayload[0] = 0x47
+        tsPayload[188] = 0x47
+        val cloaked = fakePngPrefix + tsPayload
+
+        val cleaned = StreamDownloader.stripCloakedTsPrefix(cloaked)
+        assertEquals(376, cleaned.size)
+        assertEquals(0x47.toByte(), cleaned[0])
+        assertEquals(0x47.toByte(), cleaned[188])
     }
 
     @Test
@@ -89,7 +131,7 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `isProbeCandidate flags range and video destination requests`() {
+    fun `isProbeCandidate flags range video destination and disguised playlists`() {
         assertTrue(
             MediaSniffer.isProbeCandidate(
                 url = "https://cdn.example.org/stream/8912345",
@@ -104,6 +146,14 @@ class ExampleRobolectricTest {
                 acceptHeader = "*/*",
                 rangeHeader = null,
                 secFetchDest = "video"
+            )
+        )
+        assertTrue(
+            MediaSniffer.isProbeCandidate(
+                url = "https://embed.example.net/hls2/01/master.txt?t=abc",
+                acceptHeader = "*/*",
+                rangeHeader = null,
+                secFetchDest = "empty"
             )
         )
         assertFalse(

@@ -18,15 +18,27 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStream
+import java.io.SequenceInputStream
 import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -121,7 +133,6 @@ class StreamDownloader(
 
     private suspend fun downloadDirectFile(entity: DownloadEntity) {
         val targetFile = File(getVideosDir(), entity.fileName)
-        val req = buildRequest(entity.sourceUrl, entity)
 
         repository.updateDownloadProgress(
             id = entity.id,
@@ -132,23 +143,61 @@ class StreamDownloader(
             statusDetail = "Menghubungkan ke server..."
         )
 
-        client.newCall(req).execute().use { response ->
+        executeWithHeaderFallback(entity.sourceUrl, entity).use { response ->
             if (!response.isSuccessful) {
-                throw IllegalStateException("HTTP ${response.code}: Server menolak unduhan (token mungkin kedaluwarsa)")
+                throw IllegalStateException("HTTP ${response.code}: Server menolak unduhan (token sesi mungkin kedaluwarsa)")
             }
 
             val rawContentType = response.header("Content-Type")?.substringBefore(';')?.trim().orEmpty()
-            if (rawContentType.startsWith("text/html", ignoreCase = true)) {
-                throw IllegalStateException("Tautan mengembalikan halaman HTML, bukan stream video langsung")
-            }
-
             val body = response.body ?: throw IllegalStateException("Respons stream kosong")
             val totalBytes = body.contentLength().takeIf { it > 0 } ?: entity.totalBytes
-            val mime = rawContentType.takeIf { it.startsWith("video/") } ?: entity.mimeType
 
+            // Peek first 512 bytes to auto-detect disguised HLS/DASH playlists or HTML error pages
+            val rawStream = body.byteStream()
+            val headBuf = ByteArray(512)
+            var headRead = 0
+            while (headRead < headBuf.size) {
+                val r = rawStream.read(headBuf, headRead, headBuf.size - headRead)
+                if (r <= 0) break
+                headRead += r
+            }
+            val headSlice = headBuf.copyOf(headRead)
+            val magicMime = MediaSniffer.detectMimeFromMagicBytes(headSlice)
+
+            if (rawContentType.contains("mpegurl", ignoreCase = true) ||
+                magicMime == "application/vnd.apple.mpegurl"
+            ) {
+                response.close()
+                downloadHlsStream(entity.copy(format = MediaFormat.HLS.label))
+                return
+            }
+
+            if (rawContentType.contains("dash+xml", ignoreCase = true) ||
+                magicMime == "application/dash+xml"
+            ) {
+                response.close()
+                downloadDashStream(entity.copy(format = MediaFormat.DASH.label))
+                return
+            }
+
+            val headAscii = runCatching {
+                String(headSlice, Charsets.UTF_8).trimStart()
+            }.getOrDefault("")
+            if (rawContentType.startsWith("text/html", ignoreCase = true) ||
+                headAscii.startsWith("<!DOCTYPE", ignoreCase = true) ||
+                headAscii.startsWith("<html", ignoreCase = true)
+            ) {
+                throw IllegalStateException("Server mengembalikan halaman HTML, bukan file video langsung")
+            }
+
+            val mime = magicMime
+                ?: rawContentType.takeIf { it.startsWith("video/") }
+                ?: entity.mimeType
+
+            val combinedStream = SequenceInputStream(ByteArrayInputStream(headSlice), rawStream)
             streamBodyToFile(
                 entity = entity,
-                input = body.byteStream(),
+                input = combinedStream,
                 targetFile = targetFile,
                 totalBytes = totalBytes,
                 progressMin = 0,
@@ -239,7 +288,7 @@ class StreamDownloader(
             statusDetail = "Membaca manifest DASH (.mpd)..."
         )
 
-        val xml = fetchText(entity.sourceUrl, entity)
+        val xml = fetchTextWithRetry(entity.sourceUrl, entity)
         val plan = DashManifestParser.parse(entity.sourceUrl, xml)
 
         if (plan.isDrmProtected) {
@@ -336,33 +385,60 @@ class StreamDownloader(
             throw IllegalStateException("$label tidak berisi segmen")
         }
 
-        var written = 0L
         val totalSegs = track.segmentUrls.size
-        FileOutputStream(outFile).use { output ->
-            if (!track.initUrl.isNullOrBlank()) {
-                val initBytes = fetchBytes(track.initUrl, entity)
-                output.write(initBytes)
-                written += initBytes.size
-            }
-            track.segmentUrls.forEachIndexed { index, segUrl ->
-                scope.coroutineContext.ensureActive()
-                val bytes = fetchBytes(segUrl, entity)
-                output.write(bytes)
-                written += bytes.size
+        val completedCount = AtomicInteger(0)
+        val totalBytes = AtomicLong(0L)
+        val batchDir = File(getTempDir(), "dash_${entity.id}_${System.nanoTime()}").apply { mkdirs() }
 
-                val fraction = (index + 1).toFloat() / totalSegs.toFloat()
-                val pct = (progressMin + (fraction * (progressMax - progressMin)).toInt())
-                    .coerceIn(progressMin, progressMax)
-                repository.updateDownloadProgress(
-                    id = entity.id,
-                    status = DownloadStatus.DOWNLOADING.name,
-                    downloadedBytes = written,
-                    totalBytes = 0L,
-                    progressPercent = pct,
-                    statusDetail = "$label ${index + 1}/$totalSegs • ${MediaSniffer.formatBytes(written)}"
-                )
+        try {
+            val initBytes = if (!track.initUrl.isNullOrBlank()) {
+                fetchBytesWithRetry(track.initUrl, entity).also { totalBytes.addAndGet(it.size.toLong()) }
+            } else {
+                null
             }
-            output.flush()
+
+            val sem = Semaphore(4)
+            val segFiles = Array<File?>(totalSegs) { null }
+
+            coroutineScope {
+                track.segmentUrls.mapIndexed { idx, segUrl ->
+                    async(Dispatchers.IO) {
+                        sem.withPermit {
+                            ensureActive()
+                            val bytes = fetchBytesWithRetry(segUrl, entity)
+                            val f = File(batchDir, "s_$idx.bin")
+                            f.writeBytes(bytes)
+                            segFiles[idx] = f
+
+                            val done = completedCount.incrementAndGet()
+                            val bytesSoFar = totalBytes.addAndGet(bytes.size.toLong())
+                            val fraction = done.toFloat() / totalSegs.toFloat()
+                            val pct = (progressMin + (fraction * (progressMax - progressMin)).toInt())
+                                .coerceIn(progressMin, progressMax)
+                            repository.updateDownloadProgress(
+                                id = entity.id,
+                                status = DownloadStatus.DOWNLOADING.name,
+                                downloadedBytes = bytesSoFar,
+                                totalBytes = 0L,
+                                progressPercent = pct,
+                                statusDetail = "$label $done/$totalSegs • ${MediaSniffer.formatBytes(bytesSoFar)}"
+                            )
+                        }
+                    }
+                }.awaitAll()
+            }
+
+            FileOutputStream(outFile).use { output ->
+                if (initBytes != null) output.write(initBytes)
+                for (f in segFiles) {
+                    if (f != null && f.exists()) {
+                        f.inputStream().use { it.copyTo(output) }
+                    }
+                }
+                output.flush()
+            }
+        } finally {
+            runCatching { batchDir.deleteRecursively() }
         }
     }
 
@@ -377,15 +453,15 @@ class StreamDownloader(
         )
 
         var playlistUrl = entity.sourceUrl
-        var playlistText = fetchText(playlistUrl, entity)
+        var playlistText = fetchTextWithRetry(playlistUrl, entity)
         var separateAudioPlaylistUrl: String? = null
 
-        // If master playlist, select the highest-bandwidth variant and check for separate audio rendition
+        // If master playlist, select highest-bandwidth variant and check separate audio rendition
         if (playlistText.contains("#EXT-X-STREAM-INF")) {
             val masterChoice = parseMasterPlaylist(playlistUrl, playlistText)
             if (masterChoice.videoVariantUrl != null) {
                 playlistUrl = masterChoice.videoVariantUrl
-                playlistText = fetchText(playlistUrl, entity)
+                playlistText = fetchTextWithRetry(playlistUrl, entity)
             }
             separateAudioPlaylistUrl = masterChoice.audioRenditionUrl
         }
@@ -408,12 +484,12 @@ class StreamDownloader(
             val tempVideo = File(getTempDir(), "hls_vid_${entity.id}.mp4")
             val tempAudio = File(getTempDir(), "hls_aud_${entity.id}.m4a")
             try {
-                downloadHlsMediaSegments(entity, parsed, tempVideo, progressMin = 2, progressMax = 68, label = "Video")
-                val audioText = fetchText(separateAudioPlaylistUrl, entity)
+                downloadHlsMediaSegments(entity, parsed, tempVideo, isFmp4 = true, progressMin = 2, progressMax = 68, label = "Video")
+                val audioText = fetchTextWithRetry(separateAudioPlaylistUrl, entity)
                 val audioParsed = parseMediaPlaylist(separateAudioPlaylistUrl, audioText)
                 val audioOk = if (audioParsed.segments.isNotEmpty()) {
                     runCatching {
-                        downloadHlsMediaSegments(entity, audioParsed, tempAudio, progressMin = 70, progressMax = 90, label = "Audio")
+                        downloadHlsMediaSegments(entity, audioParsed, tempAudio, isFmp4 = true, progressMin = 70, progressMax = 90, label = "Audio")
                         true
                     }.getOrDefault(false)
                 } else {
@@ -450,7 +526,7 @@ class StreamDownloader(
             return
         }
 
-        downloadHlsMediaSegments(entity, parsed, targetFile, progressMin = 1, progressMax = 99, label = "Segmen")
+        downloadHlsMediaSegments(entity, parsed, targetFile, isFmp4 = isFmp4, progressMin = 1, progressMax = 99, label = "Segmen")
 
         finalizeDownload(
             entity = entity,
@@ -466,57 +542,98 @@ class StreamDownloader(
         entity: DownloadEntity,
         parsed: HlsPlaylist,
         outFile: File,
+        isFmp4: Boolean,
         progressMin: Int,
         progressMax: Int,
         label: String
     ) {
-        var totalBytesWritten = 0L
         val totalSegments = parsed.segments.size
-        var currentKeyBytes: ByteArray? = null
-        var currentKeyUri: String? = null
+        val keyCache = ConcurrentHashMap<String, ByteArray>()
+        val completedCount = AtomicInteger(0)
+        val totalBytes = AtomicLong(0L)
+        val batchDir = File(getTempDir(), "hls_${entity.id}_${System.nanoTime()}").apply { mkdirs() }
 
-        FileOutputStream(outFile).use { output ->
-            if (parsed.initMapUrl != null) {
-                val initBytes = fetchBytes(parsed.initMapUrl, entity)
-                output.write(initBytes)
-                totalBytesWritten += initBytes.size
+        // Pre-validate DRM & pre-fetch unique AES-128 keys before launching parallel segment jobs
+        val uniqueKeyUris = linkedSetOf<String>()
+        for (seg in parsed.segments) {
+            if (seg.keyMethod.equals("SAMPLE-AES", ignoreCase = true) ||
+                seg.keyMethod.equals("SAMPLE-AES-CTR", ignoreCase = true)
+            ) {
+                throw IllegalStateException("Stream HLS ini memakai enkripsi DRM (${seg.keyMethod})")
+            }
+            if (seg.keyMethod.equals("AES-128", ignoreCase = true) && !seg.keyUri.isNullOrBlank()) {
+                uniqueKeyUris.add(seg.keyUri)
+            }
+        }
+        for (keyUri in uniqueKeyUris) {
+            keyCache[keyUri] = fetchBytesWithRetry(keyUri, entity)
+        }
+
+        try {
+            val initBytes = if (parsed.initMapUrl != null) {
+                fetchBytesWithRetry(parsed.initMapUrl, entity, parsed.initMapByteRange).also {
+                    totalBytes.addAndGet(it.size.toLong())
+                }
+            } else {
+                null
             }
 
-            parsed.segments.forEachIndexed { index, seg ->
-                scope.coroutineContext.ensureActive()
+            val sem = Semaphore(4)
+            val segFiles = Array<File?>(totalSegments) { null }
 
-                if (seg.keyMethod == "SAMPLE-AES") {
-                    throw IllegalStateException("Stream ini menggunakan enkripsi DRM SAMPLE-AES")
-                }
+            coroutineScope {
+                parsed.segments.mapIndexed { index, seg ->
+                    async(Dispatchers.IO) {
+                        sem.withPermit {
+                            ensureActive()
+                            val rawBytes = fetchBytesWithRetry(seg.url, entity, seg.byteRangeHeader)
+                            val decrypted = if (seg.keyMethod.equals("AES-128", ignoreCase = true) &&
+                                !seg.keyUri.isNullOrBlank()
+                            ) {
+                                val key = keyCache[seg.keyUri]
+                                if (key != null) {
+                                    decryptAes128(rawBytes, key, seg.ivBytes ?: indexToIv(seg.sequenceIndex))
+                                } else {
+                                    rawBytes
+                                }
+                            } else {
+                                rawBytes
+                            }
+                            val finalBytes = if (!isFmp4) stripCloakedTsPrefix(decrypted) else decrypted
 
-                if (seg.keyMethod == "AES-128" && seg.keyUri != null && seg.keyUri != currentKeyUri) {
-                    currentKeyBytes = fetchBytes(seg.keyUri, entity)
-                    currentKeyUri = seg.keyUri
-                }
+                            val f = File(batchDir, "seg_$index.bin")
+                            f.writeBytes(finalBytes)
+                            segFiles[index] = f
 
-                val rawBytes = fetchBytes(seg.url, entity)
-                val finalBytes = if (seg.keyMethod == "AES-128" && currentKeyBytes != null) {
-                    decryptAes128(rawBytes, currentKeyBytes!!, seg.ivBytes ?: indexToIv(seg.sequenceIndex))
-                } else {
-                    rawBytes
-                }
-
-                output.write(finalBytes)
-                totalBytesWritten += finalBytes.size
-
-                val fraction = (index + 1).toFloat() / totalSegments.toFloat()
-                val pct = (progressMin + (fraction * (progressMax - progressMin)).toInt())
-                    .coerceIn(progressMin, progressMax)
-                repository.updateDownloadProgress(
-                    id = entity.id,
-                    status = DownloadStatus.DOWNLOADING.name,
-                    downloadedBytes = totalBytesWritten,
-                    totalBytes = 0L,
-                    progressPercent = pct,
-                    statusDetail = "$label ${index + 1}/$totalSegments • ${MediaSniffer.formatBytes(totalBytesWritten)}"
-                )
+                            val done = completedCount.incrementAndGet()
+                            val bytesSoFar = totalBytes.addAndGet(finalBytes.size.toLong())
+                            val fraction = done.toFloat() / totalSegments.toFloat()
+                            val pct = (progressMin + (fraction * (progressMax - progressMin)).toInt())
+                                .coerceIn(progressMin, progressMax)
+                            repository.updateDownloadProgress(
+                                id = entity.id,
+                                status = DownloadStatus.DOWNLOADING.name,
+                                downloadedBytes = bytesSoFar,
+                                totalBytes = 0L,
+                                progressPercent = pct,
+                                statusDetail = "$label $done/$totalSegments • ${MediaSniffer.formatBytes(bytesSoFar)}"
+                            )
+                        }
+                    }
+                }.awaitAll()
             }
-            output.flush()
+
+            FileOutputStream(outFile).use { output ->
+                if (initBytes != null) output.write(initBytes)
+                for (f in segFiles) {
+                    if (f != null && f.exists()) {
+                        f.inputStream().use { it.copyTo(output) }
+                    }
+                }
+                output.flush()
+            }
+        } finally {
+            runCatching { batchDir.deleteRecursively() }
         }
     }
 
@@ -528,8 +645,7 @@ class StreamDownloader(
         progressMax: Int,
         prefixLabel: String
     ) {
-        val req = buildRequest(url, entity)
-        client.newCall(req).execute().use { response ->
+        executeWithHeaderFallback(url, entity).use { response ->
             if (!response.isSuccessful) {
                 throw IllegalStateException("HTTP ${response.code}: Gagal mengunduh trek media")
             }
@@ -549,7 +665,7 @@ class StreamDownloader(
 
     private suspend fun streamBodyToFile(
         entity: DownloadEntity,
-        input: java.io.InputStream,
+        input: InputStream,
         targetFile: File,
         totalBytes: Long,
         progressMin: Int,
@@ -688,33 +804,109 @@ class StreamDownloader(
         context.startActivity(chooser)
     }
 
-    private fun buildRequest(url: String, entity: DownloadEntity): Request {
+    private fun buildRequest(
+        url: String,
+        entity: DownloadEntity,
+        includeOrigin: Boolean = true,
+        includeReferer: Boolean = true,
+        includeCookie: Boolean = true,
+        rangeHeader: String? = null
+    ): Request {
         val builder = Request.Builder().url(url)
         if (entity.userAgent.isNotBlank()) builder.header("User-Agent", entity.userAgent)
-        if (entity.referer.isNotBlank()) builder.header("Referer", entity.referer)
-        val origin = entity.originHeader.ifBlank {
-            MediaSniffer.deriveOriginHeader(entity.referer, entity.pageUrl)
-        }
-        if (origin.isNotBlank()) builder.header("Origin", origin)
-        if (entity.cookie.isNotBlank()) builder.header("Cookie", entity.cookie)
+        if (includeReferer && entity.referer.isNotBlank()) builder.header("Referer", entity.referer)
+        if (includeOrigin && entity.originHeader.isNotBlank()) builder.header("Origin", entity.originHeader)
+        if (includeCookie && entity.cookie.isNotBlank()) builder.header("Cookie", entity.cookie)
+        if (!rangeHeader.isNullOrBlank()) builder.header("Range", rangeHeader)
         builder.header("Accept", "*/*")
         return builder.build()
     }
 
-    private fun fetchText(url: String, entity: DownloadEntity): String {
-        val req = buildRequest(url, entity)
-        client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code} saat membaca manifest")
-            return resp.body?.string().orEmpty()
+    /**
+     * Executes an HTTP request with smart 401/403 header fallback so strict CORS CDNs
+     * (rejecting Origin or cross-site Referer) still download reliably.
+     */
+    private fun executeWithHeaderFallback(
+        url: String,
+        entity: DownloadEntity,
+        rangeHeader: String? = null
+    ): Response {
+        val strategies = listOf(
+            Triple(true, true, true),    // Full captured session headers
+            Triple(false, true, true),   // Drop Origin (fixes strict CORS CDNs)
+            Triple(false, false, true),  // Drop Referer + Origin (fixes hotlink-strict CDNs)
+            Triple(false, false, false)  // Clean User-Agent only
+        )
+        var lastResponse: Response? = null
+        for ((idx, strat) in strategies.withIndex()) {
+            val (useOrigin, useReferer, useCookie) = strat
+            if (idx == 1 && entity.originHeader.isBlank()) continue
+            if (idx == 2 && entity.referer.isBlank()) continue
+            if (idx == 3 && entity.cookie.isBlank()) continue
+
+            lastResponse?.close()
+            val req = buildRequest(
+                url = url,
+                entity = entity,
+                includeOrigin = useOrigin,
+                includeReferer = useReferer,
+                includeCookie = useCookie,
+                rangeHeader = rangeHeader
+            )
+            val resp = client.newCall(req).execute()
+            if (resp.isSuccessful || resp.code == 206) {
+                return resp
+            }
+            lastResponse = resp
+            if (resp.code != 401 && resp.code != 403) {
+                return resp
+            }
         }
+        return lastResponse ?: client.newCall(buildRequest(url, entity, rangeHeader = rangeHeader)).execute()
     }
 
-    private fun fetchBytes(url: String, entity: DownloadEntity): ByteArray {
-        val req = buildRequest(url, entity)
-        client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code} saat mengunduh segmen")
-            return resp.body?.bytes() ?: ByteArray(0)
+    private suspend fun fetchTextWithRetry(url: String, entity: DownloadEntity): String {
+        var lastErr: Exception? = null
+        for (attempt in 1..3) {
+            try {
+                executeWithHeaderFallback(url, entity).use { resp ->
+                    if (!resp.isSuccessful) {
+                        throw IllegalStateException("HTTP ${resp.code} saat membaca manifest")
+                    }
+                    return resp.body?.string().orEmpty()
+                }
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                lastErr = e
+                if (attempt < 3) delay(350L * attempt)
+            }
         }
+        throw lastErr ?: IllegalStateException("Gagal membaca manifest stream")
+    }
+
+    private suspend fun fetchBytesWithRetry(
+        url: String,
+        entity: DownloadEntity,
+        rangeHeader: String? = null
+    ): ByteArray {
+        var lastErr: Exception? = null
+        for (attempt in 1..3) {
+            try {
+                executeWithHeaderFallback(url, entity, rangeHeader).use { resp ->
+                    if (!resp.isSuccessful && resp.code != 206) {
+                        throw IllegalStateException("HTTP ${resp.code} saat mengunduh segmen")
+                    }
+                    return resp.body?.bytes() ?: ByteArray(0)
+                }
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                lastErr = e
+                if (attempt < 3) delay(300L * attempt)
+            }
+        }
+        throw lastErr ?: IllegalStateException("Gagal mengunduh segmen stream")
     }
 
     private fun resolveRelativeUrl(baseUrl: String, relative: String): String {
@@ -766,11 +958,13 @@ class StreamDownloader(
         val sequenceIndex: Long,
         val keyMethod: String? = null,
         val keyUri: String? = null,
-        val ivBytes: ByteArray? = null
+        val ivBytes: ByteArray? = null,
+        val byteRangeHeader: String? = null
     )
 
     private data class HlsPlaylist(
         val initMapUrl: String? = null,
+        val initMapByteRange: String? = null,
         val segments: List<HlsSegment>
     )
 
@@ -781,9 +975,12 @@ class StreamDownloader(
         var currentKeyUri: String? = null
         var currentIv: ByteArray? = null
         var initMapUrl: String? = null
+        var initMapByteRange: String? = null
         val segments = mutableListOf<HlsSegment>()
         var expectSegment = false
         var seqOffset = 0L
+        var pendingByteRangeHeader: String? = null
+        var lastByteRangeEnd = 0L
 
         for (line in lines) {
             when {
@@ -794,6 +991,11 @@ class StreamDownloader(
                     val uriMatch = Regex("""URI="([^"]+)"""").find(line)
                     val rel = uriMatch?.groupValues?.getOrNull(1)
                     if (rel != null) initMapUrl = resolveRelativeUrl(playlistUrl, rel)
+                    val brMatch = Regex("""BYTERANGE="([^"]+)"""").find(line)?.groupValues?.getOrNull(1)
+                    if (brMatch != null) {
+                        val (header, _) = parseHlsByteRange(brMatch, 0L)
+                        initMapByteRange = header
+                    }
                 }
                 line.startsWith("#EXT-X-KEY:") -> {
                     val methodMatch = Regex("""METHOD=([^,]+)""").find(line)
@@ -805,6 +1007,12 @@ class StreamDownloader(
                     }
                     currentIv = ivMatch?.groupValues?.getOrNull(1)?.let { hexToBytes(it) }
                 }
+                line.startsWith("#EXT-X-BYTERANGE:") -> {
+                    val spec = line.substringAfter(':').trim()
+                    val (header, nextEnd) = parseHlsByteRange(spec, lastByteRangeEnd)
+                    pendingByteRangeHeader = header
+                    lastByteRangeEnd = nextEnd
+                }
                 line.startsWith("#EXTINF:") -> {
                     expectSegment = true
                 }
@@ -815,15 +1023,29 @@ class StreamDownloader(
                             sequenceIndex = mediaSequence + seqOffset,
                             keyMethod = currentKeyMethod,
                             keyUri = currentKeyUri,
-                            ivBytes = currentIv
+                            ivBytes = currentIv,
+                            byteRangeHeader = pendingByteRangeHeader
                         )
                     )
+                    pendingByteRangeHeader = null
                     seqOffset++
                     expectSegment = false
                 }
             }
         }
-        return HlsPlaylist(initMapUrl = initMapUrl, segments = segments)
+        return HlsPlaylist(
+            initMapUrl = initMapUrl,
+            initMapByteRange = initMapByteRange,
+            segments = segments
+        )
+    }
+
+    private fun parseHlsByteRange(spec: String, defaultOffset: Long): Pair<String?, Long> {
+        val parts = spec.split('@')
+        val length = parts.getOrNull(0)?.toLongOrNull() ?: return null to defaultOffset
+        val start = parts.getOrNull(1)?.toLongOrNull() ?: defaultOffset
+        val end = (start + length - 1L).coerceAtLeast(start)
+        return "bytes=$start-$end" to (end + 1L)
     }
 
     private fun decryptAes128(data: ByteArray, key: ByteArray, iv: ByteArray): ByteArray {
@@ -846,6 +1068,24 @@ class StreamDownloader(
         val padded = hex.padStart(32, '0').takeLast(32)
         return ByteArray(16) { i ->
             padded.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+        }
+    }
+
+    companion object {
+        /**
+         * Some streaming CDNs disguise MPEG-TS segments with fake PNG/GIF/JPEG header bytes
+         * (e.g. .png/.jpg segments). If data does not begin with MPEG-TS sync byte 0x47,
+         * locates the first valid 188-byte sync pair (0x47 at i and i+188) and strips the fake prefix.
+         */
+        fun stripCloakedTsPrefix(data: ByteArray): ByteArray {
+            if (data.isEmpty() || data[0] == 0x47.toByte()) return data
+            val scanLimit = (data.size - 189).coerceAtMost(4096)
+            for (i in 1..scanLimit) {
+                if (data[i] == 0x47.toByte() && data[i + 188] == 0x47.toByte()) {
+                    return data.copyOfRange(i, data.size)
+                }
+            }
+            return data
         }
     }
 }

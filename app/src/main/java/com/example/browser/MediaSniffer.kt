@@ -52,9 +52,10 @@ object MediaSniffer {
 
     private val ignoredExtensions = setOf(
         "js", "mjs", "css", "png", "jpg", "jpeg", "gif", "webp", "avif", "svg", "ico",
-        "woff", "woff2", "ttf", "otf", "eot", "json", "vtt", "srt", "ass",
-        "html", "htm", "php", "txt", "map"
+        "woff", "woff2", "ttf", "otf", "eot", "vtt", "srt", "ass", "map"
     )
+
+    private val probeableTextExtensions = setOf("txt", "php", "asp", "aspx", "jsp", "cgi", "json")
 
     private val directVideoExtensions = mapOf(
         "mp4" to MediaFormat.MP4,
@@ -78,11 +79,30 @@ object MediaSniffer {
         "cdninstagram.com",
         "fbcdn.net",
         "vimeocdn.com",
-        "dmcdn.net"
+        "dmcdn.net",
+        "googlevideo.com",
+        "cloudflarestream.com",
+        "b-cdn.net",
+        "akamaized.net",
+        "cloudfront.net",
+        "fastly.net",
+        "mux.com",
+        "jwplatform.com",
+        "jwpcdn.com",
+        "okcdn.ru",
+        "vkuservideo.net",
+        "rumble.com",
+        "kwcdn.com",
+        "kwai-pro.com"
+    )
+
+    private val streamPathKeywords = listOf(
+        "m3u8", "hls", "master", "playlist", "chunklist", "manifest",
+        "stream", "video", "play", "mpd", "media", "embed", "get_video", "vid/"
     )
 
     /**
-     * Removes MSE byte-range query parameters (bytestart/byteend/range) so IG/FB/YouTube
+     * Removes MSE byte-range query parameters (bytestart/byteend) so IG/FB/YouTube
      * chunked requests resolve to the full downloadable video URL instead of a tiny slice.
      */
     fun normalizeVideoUrl(url: String): String {
@@ -122,6 +142,53 @@ object MediaSniffer {
         }.getOrDefault("")
     }
 
+    /**
+     * Inspects the first bytes of a network response to detect real media formats even when
+     * streaming servers disguise playlists/videos with fake extensions (.txt/.php) or
+     * generic Content-Type headers (text/plain, application/octet-stream).
+     */
+    fun detectMimeFromMagicBytes(bytes: ByteArray): String? {
+        if (bytes.size < 6) return null
+
+        // Check text-based manifests (#EXTM3U for HLS, <MPD for DASH)
+        val asciiHead = runCatching {
+            String(bytes, 0, bytes.size.coerceAtMost(256), Charsets.UTF_8).trimStart('\uFEFF', ' ', '\r', '\n', '\t')
+        }.getOrDefault("")
+
+        if (asciiHead.startsWith("#EXTM3U", ignoreCase = true)) {
+            return "application/vnd.apple.mpegurl"
+        }
+        if (asciiHead.contains("<MPD", ignoreCase = true) && asciiHead.contains("urn:mpeg:dash", ignoreCase = true)) {
+            return "application/dash+xml"
+        }
+        if (asciiHead.startsWith("<MPD", ignoreCase = true) ||
+            (asciiHead.startsWith("<?xml", ignoreCase = true) && asciiHead.contains("<MPD", ignoreCase = true))
+        ) {
+            return "application/dash+xml"
+        }
+
+        // MP4 / ISO Base Media File Format ('ftyp' at byte offset 4..7)
+        if (bytes.size >= 12 &&
+            bytes[4] == 'f'.code.toByte() &&
+            bytes[5] == 't'.code.toByte() &&
+            bytes[6] == 'y'.code.toByte() &&
+            bytes[7] == 'p'.code.toByte()
+        ) {
+            return "video/mp4"
+        }
+
+        // WebM / Matroska EBML header (0x1A 0x45 0xDF 0xA3)
+        if (bytes[0] == 0x1A.toByte() &&
+            bytes[1] == 0x45.toByte() &&
+            bytes[2] == 0xDF.toByte() &&
+            bytes[3] == 0xA3.toByte()
+        ) {
+            return "video/webm"
+        }
+
+        return null
+    }
+
     fun classifyUrl(url: String, hintMime: String? = null): MediaFormat? {
         if (url.isBlank() || url.startsWith("blob:") || url.startsWith("data:")) {
             return null
@@ -139,8 +206,8 @@ object MediaSniffer {
             .substringBefore('?')
             .substringBefore('#')
 
-        // Skip obvious non-video assets and single HLS/DASH segment chunks
-        if (ext in ignoredExtensions || ext == "ts" || ext == "m4s") {
+        // Skip single HLS/DASH segment chunks (we want the playlist, not individual .ts/.m4s chunks)
+        if (ext == "ts" || ext == "m4s") {
             return null
         }
 
@@ -153,7 +220,7 @@ object MediaSniffer {
             return null
         }
 
-        // 1. Check MIME hint (from Content-Type probe or Accept/type hint)
+        // 1. Check MIME hint FIRST (from Content-Type / Magic-Bytes probe) so disguised .txt/.php playlists match!
         val mime = hintMime?.lowercase(Locale.US).orEmpty()
         if (mime.contains("mpegurl") || mime.contains("m3u8")) return MediaFormat.HLS
         if (mime.contains("dash+xml")) return MediaFormat.DASH
@@ -166,11 +233,16 @@ object MediaSniffer {
             }
         }
 
+        // Skip obvious static non-video assets when no video MIME was confirmed
+        if (ext in ignoredExtensions || ext == "html" || ext == "htm" || ext == "json") {
+            return null
+        }
+
         // 2. Check explicit streaming/video extensions
-        if (ext == "m3u8" || normalized.contains(".m3u8?") || normalized.endsWith(".m3u8")) {
+        if (ext == "m3u8" || normalized.contains(".m3u8?") || normalized.contains(".m3u8&") || normalized.endsWith(".m3u8")) {
             return MediaFormat.HLS
         }
-        if (ext == "mpd" || normalized.contains(".mpd?") || normalized.endsWith(".mpd")) {
+        if (ext == "mpd" || normalized.contains(".mpd?") || normalized.contains(".mpd&") || normalized.endsWith(".mpd")) {
             return MediaFormat.DASH
         }
         directVideoExtensions[ext]?.let { return it }
@@ -185,6 +257,9 @@ object MediaSniffer {
             (normalized.contains("/videoplayback") && normalized.contains("itag=")))
         if (hasVideoQuery) {
             return MediaFormat.MP4
+        }
+        if (normalized.contains("format=m3u8") || normalized.contains("type=m3u8")) {
+            return MediaFormat.HLS
         }
 
         // 4. Extensionless CDN video URL patterns (TikTok, IG/FB, X, Reddit, Vimeo)
@@ -224,7 +299,6 @@ object MediaSniffer {
         val isMetaCdn = host.contains("cdninstagram.com") || host.contains("fbcdn.net")
         if (!isMetaCdn) return false
 
-        // Meta CDN serves images with /t51. and videos with /o1/v/t2/ or /v/t42/ /v/t50/ /v/t16/ or efg=...dash/video
         val looksLikeVideoPath = path.contains("/o1/v/t2/") ||
             path.contains("/v/t42.") ||
             path.contains("/v/t50.") ||
@@ -232,15 +306,13 @@ object MediaSniffer {
             path.contains("/v/t2/") ||
             fullLowerUrl.contains("video_mp4") ||
             (fullLowerUrl.contains("efg=") && (fullLowerUrl.contains("dash") || fullLowerUrl.contains("xpv")))
-        // Exclude audio-only Meta DASH tracks from primary video list
         val isAudioTrack = fullLowerUrl.contains("audio") || fullLowerUrl.contains("heaac") || fullLowerUrl.contains("dash_ln_heaac")
         return looksLikeVideoPath && !isAudioTrack
     }
 
     /**
-     * Identifies extensionless requests that strongly signal a streaming media fetch
-     * (e.g., Range requests, Sec-Fetch-Dest: video, or known media CDNs) so the ViewModel
-     * can run a lightweight Content-Type probe in the background.
+     * Identifies extensionless or disguised requests (.txt/.php/master/playlist/Range/video-dest/CDN)
+     * so the ViewModel can run a lightweight Content-Type + Magic-Bytes probe in the background.
      */
     fun isProbeCandidate(
         url: String,
@@ -255,26 +327,44 @@ object MediaSniffer {
 
         val host = uri.host?.lowercase(Locale.US).orEmpty()
         val path = (uri.path ?: "").lowercase(Locale.US)
+        val fullLower = url.lowercase(Locale.US)
         val ext = path.substringAfterLast('/', "")
             .substringAfterLast('.', "")
             .substringBefore('?')
             .substringBefore('#')
 
-        if (ext in ignoredExtensions || ext == "ts" || ext == "m4s") return false
+        if (ext in ignoredExtensions || ext == "ts" || ext == "m4s" || ext == "html" || ext == "htm") {
+            return false
+        }
         if (AdBlockEngine.isAdHost(host)) return false
+
+        // Skip obvious audio-only endpoints
+        if (fullLower.contains("mime=audio") || fullLower.contains("mime_type=audio") || ext == "m4a" || ext == "mp3") {
+            return false
+        }
 
         val dest = secFetchDest?.lowercase(Locale.US).orEmpty()
         if (dest == "video") return true
 
         val accept = acceptHeader?.lowercase(Locale.US).orEmpty()
-        if (accept.contains("video/")) return true
+        if (accept.contains("video/") || accept.contains("mpegurl") || accept.contains("dash+xml")) return true
 
         if (!rangeHeader.isNullOrBlank() && rangeHeader.startsWith("bytes=", ignoreCase = true)) {
             return true
         }
 
+        // Disguised HLS/DASH/MP4 endpoints (.txt, .php, extensionless) with streaming path hints
+        val hasStreamKeyword = streamPathKeywords.any { path.contains(it) || fullLower.contains("?$it") || fullLower.contains("&$it") }
+        if (hasStreamKeyword && (ext.isEmpty() || ext in probeableTextExtensions)) {
+            // Avoid probing generic API/analytics json endpoints unless strongly video-named
+            if (ext == "json" && !fullLower.contains("hls") && !fullLower.contains("m3u8") && !fullLower.contains("manifest")) {
+                return false
+            }
+            return true
+        }
+
         if (knownVideoCdnHosts.any { host == it || host.endsWith(".$it") }) {
-            return path.contains("video") || path.contains("/v/") || path.contains("play") || path.contains("stream")
+            return hasStreamKeyword || path.contains("/v/") || path.contains("/e/")
         }
 
         return false
@@ -292,6 +382,9 @@ object MediaSniffer {
         if (cleanSegment.length in 4..48 &&
             cleanSegment.contains('.') &&
             !cleanSegment.startsWith("tos_") &&
+            !cleanSegment.startsWith("master.") &&
+            !cleanSegment.startsWith("index.") &&
+            !cleanSegment.startsWith("playlist.") &&
             !cleanSegment.matches(Regex("^[0-9a-fA-F_.-]+$"))
         ) {
             return cleanSegment
@@ -324,8 +417,8 @@ object MediaSniffer {
     }
 
     /**
-     * Probes stream metadata using HEAD first, falling back to a 2-byte Range GET request
-     * for CDNs (like TikTok/IG) that reject HEAD requests with 403/405.
+     * Probes stream metadata with a lightweight 256-byte Range GET (with 403 header fallback & HEAD fallback)
+     * to read BOTH Content-Type/size AND magic bytes (#EXTM3U, <MPD, ftyp, WebM) in one shot.
      */
     suspend fun probeMediaMetadata(
         url: String,
@@ -334,53 +427,87 @@ object MediaSniffer {
         userAgent: String,
         cookie: String
     ): MediaProbeResult = withContext(Dispatchers.IO) {
-        val effectiveOrigin = originHeader.ifBlank { deriveOriginHeader(referer, url) }
-
-        fun buildBase(builder: Request.Builder): Request.Builder {
+        fun buildAttempt(includeOrigin: Boolean, includeReferer: Boolean, methodHead: Boolean): Request {
+            val builder = Request.Builder().url(url)
+            if (methodHead) {
+                builder.head()
+            } else {
+                builder.get().header("Range", "bytes=0-255")
+            }
             if (userAgent.isNotBlank()) builder.header("User-Agent", userAgent)
-            if (referer.isNotBlank()) builder.header("Referer", referer)
-            if (effectiveOrigin.isNotBlank()) builder.header("Origin", effectiveOrigin)
+            if (includeReferer && referer.isNotBlank()) builder.header("Referer", referer)
+            if (includeOrigin && originHeader.isNotBlank()) builder.header("Origin", originHeader)
             if (cookie.isNotBlank()) builder.header("Cookie", cookie)
-            return builder
+            builder.header("Accept", "*/*")
+            return builder.build()
         }
 
-        // Attempt 1: HEAD
-        val headResult = runCatching {
-            val req = buildBase(Request.Builder().url(url).head()).build()
-            probeClient.newCall(req).execute().use { response ->
-                if (!response.isSuccessful) return@use null
+        fun executeRangePeek(includeOrigin: Boolean, includeReferer: Boolean): Pair<Int, MediaProbeResult?> {
+            return runCatching {
+                probeClient.newCall(buildAttempt(includeOrigin, includeReferer, methodHead = false)).execute().use { response ->
+                    val code = response.code
+                    if (!response.isSuccessful && code != 206) {
+                        return@use code to null
+                    }
+                    val contentRange = response.header("Content-Range")
+                    val totalFromRange = contentRange
+                        ?.substringAfter('/', "")
+                        ?.trim()
+                        ?.toLongOrNull()
+                        ?: -1L
+                    val contentLength = if (totalFromRange > 0L) {
+                        totalFromRange
+                    } else {
+                        response.header("Content-Length")?.toLongOrNull() ?: -1L
+                    }
+                    val rawCt = response.header("Content-Type")?.substringBefore(';')?.trim()
+
+                    // Peek up to 256 bytes safely (handles servers that ignore Range and return 200 OK!)
+                    val peekBuf = ByteArray(256)
+                    var peekRead = 0
+                    response.body?.byteStream()?.use { stream ->
+                        while (peekRead < peekBuf.size) {
+                            val r = stream.read(peekBuf, peekRead, peekBuf.size - peekRead)
+                            if (r <= 0) break
+                            peekRead += r
+                        }
+                    }
+                    val magicMime = if (peekRead >= 6) {
+                        detectMimeFromMagicBytes(peekBuf.copyOf(peekRead))
+                    } else {
+                        null
+                    }
+
+                    val resolvedCt = magicMime ?: rawCt
+                    code to MediaProbeResult(contentLength, resolvedCt)
+                }
+            }.getOrElse { -1 to null }
+        }
+
+        // Attempt 1: Range GET with exact WebView headers
+        val (code1, res1) = executeRangePeek(includeOrigin = originHeader.isNotBlank(), includeReferer = true)
+        if (res1 != null) return@withContext res1
+
+        // Attempt 2: Retry without Origin if server rejected CORS Origin with 401/403
+        if ((code1 == 401 || code1 == 403) && originHeader.isNotBlank()) {
+            val (code2, res2) = executeRangePeek(includeOrigin = false, includeReferer = true)
+            if (res2 != null) return@withContext res2
+            if (code2 == 401 || code2 == 403) {
+                val (_, res3) = executeRangePeek(includeOrigin = false, includeReferer = false)
+                if (res3 != null) return@withContext res3
+            }
+        } else if (code1 == 401 || code1 == 403) {
+            val (_, res3) = executeRangePeek(includeOrigin = false, includeReferer = false)
+            if (res3 != null) return@withContext res3
+        }
+
+        // Attempt 3: HEAD fallback for servers that disallow Range GET
+        runCatching {
+            probeClient.newCall(buildAttempt(includeOrigin = false, includeReferer = true, methodHead = true)).execute().use { response ->
+                if (!response.isSuccessful) return@use MediaProbeResult(-1L, null)
                 val len = response.header("Content-Length")?.toLongOrNull() ?: -1L
                 val ct = response.header("Content-Type")?.substringBefore(';')?.trim()
                 MediaProbeResult(len, ct)
-            }
-        }.getOrNull()
-
-        if (headResult != null && (!headResult.contentType.isNullOrBlank() || headResult.sizeBytes > 0L)) {
-            return@withContext headResult
-        }
-
-        // Attempt 2: Range GET bytes=0-1 (safe 2-byte peek for CDNs blocking HEAD)
-        runCatching {
-            val req = buildBase(Request.Builder().url(url).get())
-                .header("Range", "bytes=0-1")
-                .build()
-            probeClient.newCall(req).execute().use { response ->
-                if (!response.isSuccessful && response.code != 206) {
-                    return@use MediaProbeResult(-1L, null)
-                }
-                val contentRange = response.header("Content-Range")
-                val totalFromRange = contentRange
-                    ?.substringAfter('/', "")
-                    ?.trim()
-                    ?.toLongOrNull()
-                    ?: -1L
-                val contentLength = if (totalFromRange > 0L) {
-                    totalFromRange
-                } else {
-                    response.header("Content-Length")?.toLongOrNull() ?: -1L
-                }
-                val ct = response.header("Content-Type")?.substringBefore(';')?.trim()
-                MediaProbeResult(contentLength, ct)
             }
         }.getOrElse { MediaProbeResult(-1L, null) }
     }
@@ -411,10 +538,10 @@ object MediaSniffer {
 
     /**
      * Deep JavaScript sniffer injected into pages to capture:
-     * 1) HTML5 <video>, <source>, og:video, direct links
-     * 2) Embedded hydration/JSON metadata (TikTok, Instagram, Facebook, Next.js, LD+JSON)
-     * 3) Live fetch() and XMLHttpRequest responses (Content-Type + JSON body URL extraction)
-     * 4) PerformanceResourceTiming entries for missed CDN video requests
+     * 1) HTML5 <video>, <source>, og:video, direct links, same-origin iframes
+     * 2) Embedded hydration/JSON metadata & JWPlayer/VideoJS inline script configs
+     * 3) Live fetch() and XMLHttpRequest responses (Content-Type + #EXTM3U + JSON body extraction)
+     * 4) PerformanceResourceTiming entries for missed CDN video & playlist requests
      */
     const val MEDIA_SNIFFER_JS = """
         (function() {
@@ -458,15 +585,19 @@ object MediaSniffer {
 
                 function extractFromJsonText(text, sourceLabel) {
                     try {
-                        if (!text || text.length < 30 || text.length > 1800000) return;
+                        if (!text || text.length < 24 || text.length > 1800000) return;
 
-                        // 1. Keyed social/streaming video fields (TikTok, IG, FB, X, generic APIs)
-                        var keyedRegex = /"(?:playAddr|downloadAddr|play_addr|video_url|playable_url_quality_hd|playable_url|browser_native_hd_url|browser_native_sd_url|hls_url|dash_manifest|manifest_url|contentUrl|hd_src|sd_src|fallback_url|videoUrl|streamUrl)"\s*:\s*"(https?:[^"\\]*(?:\\.[^"\\]*)*)"/gi;
+                        // 1. Keyed social & player video fields (TikTok, IG, FB, X, JWPlayer, Plyr, VideoJS)
+                        var keyedRegex = /["']?(?:playAddr|downloadAddr|play_addr|video_url|playable_url_quality_hd|playable_url|browser_native_hd_url|browser_native_sd_url|hls_url|dash_manifest|manifest_url|contentUrl|hd_src|sd_src|fallback_url|videoUrl|streamUrl|hlsUrl|mp4Url|file|src)["']?\s*:\s*["'](https?:[^"'\\]*(?:\\.[^"'\\]*)*)["']/gi;
                         var m;
                         var count = 0;
-                        while ((m = keyedRegex.exec(text)) !== null && count < 12) {
+                        while ((m = keyedRegex.exec(text)) !== null && count < 14) {
                             var found = unescapeJsonUrl(m[1]);
-                            if (found && !/\.(jpg|jpeg|png|webp|gif|svg|js|css)(\?|$)/i.test(found)) {
+                            if (found &&
+                                !/\.(jpg|jpeg|png|webp|gif|svg|js|css|vtt|srt|ico|woff2?)(\?|#|$)/i.test(found) &&
+                                (/\.(m3u8|mpd|mp4|webm|mkv|mov)(\?|#|$)/i.test(found) ||
+                                    /hls|m3u8|mpd|video|play|stream|manifest|playlist|tos-|cdninstagram|fbcdn|twimg/i.test(found))
+                            ) {
                                 report(found, document.title, '', 0, sourceLabel);
                                 count++;
                             }
@@ -488,11 +619,11 @@ object MediaSniffer {
                             }
                         }
 
-                        // 3. Direct embedded .m3u8 / .mpd / .mp4 URLs inside JSON responses
-                        var directRegex = /"(https?:\\?\/\\?\/[^"\s<>]{12,900}?(?:\.m3u8|\.mpd|\.mp4|\.webm)(?:[^"\s<>]{0,400})?)"/gi;
+                        // 3. Direct embedded .m3u8 / .mpd / .mp4 URLs inside JSON or inline player scripts
+                        var directRegex = /["'](https?:\\?\/\\?\/[^"'\s<>]{12,900}?(?:\.m3u8|\.mpd|\.mp4|\.webm)(?:[^"'\s<>]{0,400})?)["']/gi;
                         var dm;
                         var dCount = 0;
-                        while ((dm = directRegex.exec(text)) !== null && dCount < 10) {
+                        while ((dm = directRegex.exec(text)) !== null && dCount < 12) {
                             var dUrl = unescapeJsonUrl(dm[1]);
                             if (dUrl && dUrl.indexOf('mime=audio') < 0) {
                                 report(dUrl, document.title, '', 0, sourceLabel);
@@ -502,13 +633,14 @@ object MediaSniffer {
                     } catch (e) {}
                 }
 
-                window.__streamVaultScanDom = function() {
+                function scanDocument(doc) {
                     try {
-                        var videos = document.querySelectorAll('video');
+                        if (!doc) return;
+                        var videos = doc.querySelectorAll('video');
                         videos.forEach(function(v) {
                             var res = (v.videoWidth && v.videoHeight) ? (v.videoWidth + 'x' + v.videoHeight) : '';
                             var dur = isFinite(v.duration) ? v.duration : 0;
-                            var label = v.getAttribute('title') || v.getAttribute('aria-label') || document.title;
+                            var label = v.getAttribute('title') || v.getAttribute('aria-label') || doc.title || document.title;
                             if (v.currentSrc) report(v.currentSrc, label, res, dur, 'DOM <video>');
                             if (v.src) report(v.src, label, res, dur, 'DOM <video>');
                             var sources = v.querySelectorAll('source');
@@ -517,13 +649,13 @@ object MediaSniffer {
                             });
                         });
 
-                        var metas = document.querySelectorAll('meta[property="og:video"], meta[property="og:video:url"], meta[property="og:video:secure_url"], meta[name="twitter:player:stream"]');
+                        var metas = doc.querySelectorAll('meta[property="og:video"], meta[property="og:video:url"], meta[property="og:video:secure_url"], meta[name="twitter:player:stream"]');
                         metas.forEach(function(m) {
                             var c = m.getAttribute('content');
                             if (c) report(c, document.title, '', 0, 'Meta Video');
                         });
 
-                        var anchors = document.querySelectorAll('a[href]');
+                        var anchors = doc.querySelectorAll('a[href]');
                         anchors.forEach(function(a) {
                             var href = a.href || '';
                             if (/\.(mp4|m3u8|mpd|webm|mkv|mov)(\?|#|$)/i.test(href)) {
@@ -531,22 +663,45 @@ object MediaSniffer {
                             }
                         });
 
-                        // Scan hydration & JSON-LD scripts (TikTok, IG, FB, Next.js)
-                        var scripts = document.querySelectorAll(
-                            'script#__UNIVERSAL_DATA_FOR_REHYDRATION__, script#SIGI_STATE, script#__NEXT_DATA__, script[type="application/json"], script[type="application/ld+json"]'
-                        );
-                        scripts.forEach(function(sc) {
-                            if (sc.textContent && sc.textContent.length > 40) {
-                                extractFromJsonText(sc.textContent, 'JSON Data');
+                        // Scan hydration, JSON-LD, AND inline player config scripts (JWPlayer/VideoJS/HLS)
+                        var scripts = doc.querySelectorAll('script');
+                        for (var sIdx = 0; sIdx < scripts.length && sIdx < 60; sIdx++) {
+                            var sc = scripts[sIdx];
+                            var txt = sc.textContent || '';
+                            if (txt.length < 30 || txt.length > 1500000) continue;
+                            if (sc.id === '__UNIVERSAL_DATA_FOR_REHYDRATION__' ||
+                                sc.id === 'SIGI_STATE' ||
+                                sc.id === '__NEXT_DATA__' ||
+                                sc.type === 'application/json' ||
+                                sc.type === 'application/ld+json' ||
+                                /m3u8|\.mp4|\.mpd|playAddr|video_versions|jwplayer|sources\s*[:=]/i.test(txt)
+                            ) {
+                                extractFromJsonText(txt, 'Script Data');
                             }
-                        });
+                        }
+                    } catch (e) {}
+                }
 
-                        // Scan PerformanceResourceTiming for missed media URLs
+                window.__streamVaultScanDom = function() {
+                    try {
+                        scanDocument(document);
+
+                        // Scan accessible same-origin iframes
+                        var frames = document.querySelectorAll('iframe');
+                        for (var f = 0; f < frames.length && f < 8; f++) {
+                            try {
+                                if (frames[f].contentDocument) {
+                                    scanDocument(frames[f].contentDocument);
+                                }
+                            } catch (e) {}
+                        }
+
+                        // Scan PerformanceResourceTiming for missed media/playlist URLs
                         if (window.performance && performance.getEntriesByType) {
                             var entries = performance.getEntriesByType('resource') || [];
-                            for (var i = Math.max(0, entries.length - 60); i < entries.length; i++) {
+                            for (var i = Math.max(0, entries.length - 80); i < entries.length; i++) {
                                 var name = entries[i].name || '';
-                                if (/\.(m3u8|mpd|mp4|webm)(\?|#|$)|\/video\/tos\/|video\.twimg\.com|mime_type=video/i.test(name)) {
+                                if (/\.(m3u8|mpd|mp4|webm)(\?|#|$)|\/video\/tos\/|video\.twimg\.com|mime_type=video|master\.txt|playlist|chunklist/i.test(name)) {
                                     report(name, document.title, '', 0, 'Resource');
                                 }
                             }
@@ -554,7 +709,7 @@ object MediaSniffer {
                     } catch (e) {}
                 };
 
-                // Hook fetch() requests AND inspect JSON / video Content-Type responses
+                // Hook fetch() requests AND inspect video / HLS / DASH / JSON responses
                 if (window.fetch) {
                     var origFetch = window.fetch;
                     window.fetch = function(input) {
@@ -575,10 +730,16 @@ object MediaSniffer {
                                     var finalUrl = resp.url || reqUrl;
                                     if (ct.indexOf('video/') === 0 || ct.indexOf('mpegurl') >= 0 || ct.indexOf('dash+xml') >= 0) {
                                         report(finalUrl, document.title, '', 0, 'Fetch Media');
-                                    } else if (ct.indexOf('application/json') >= 0 || ct.indexOf('text/javascript') >= 0) {
+                                    } else if (ct.indexOf('application/json') >= 0 || ct.indexOf('text/javascript') >= 0 || ct.indexOf('text/plain') >= 0 || ct.indexOf('application/octet-stream') >= 0) {
                                         var clone = resp.clone();
                                         clone.text().then(function(txt) {
-                                            extractFromJsonText(txt, 'API JSON');
+                                            if (!txt) return;
+                                            var head = txt.trimStart();
+                                            if (head.indexOf('#EXTM3U') === 0 || head.indexOf('<MPD') === 0) {
+                                                report(finalUrl, document.title, '', 0, 'Fetch Playlist');
+                                            } else if (ct.indexOf('json') >= 0 || ct.indexOf('javascript') >= 0) {
+                                                extractFromJsonText(txt, 'API JSON');
+                                            }
                                         }).catch(function() {});
                                     }
                                 } catch (e) {}
@@ -588,7 +749,7 @@ object MediaSniffer {
                     };
                 }
 
-                // Hook XMLHttpRequest open() + load response inspection
+                // Hook XMLHttpRequest open() + load response inspection (catches hls.js / dash.js / disguised .txt playlists!)
                 if (window.XMLHttpRequest) {
                     var origOpen = XMLHttpRequest.prototype.open;
                     var origSend = XMLHttpRequest.prototype.send;
@@ -611,10 +772,13 @@ object MediaSniffer {
                                     var respUrl = this.responseURL || this.__svUrl || '';
                                     if (ct.indexOf('video/') === 0 || ct.indexOf('mpegurl') >= 0 || ct.indexOf('dash+xml') >= 0) {
                                         report(respUrl, document.title, '', 0, 'XHR Media');
-                                    } else if ((ct.indexOf('application/json') >= 0 || ct.indexOf('text/plain') >= 0) &&
-                                        (!this.responseType || this.responseType === 'text') &&
-                                        this.responseText) {
-                                        extractFromJsonText(this.responseText, 'XHR JSON');
+                                    } else if ((!this.responseType || this.responseType === 'text') && this.responseText) {
+                                        var head = this.responseText.trimStart();
+                                        if (head.indexOf('#EXTM3U') === 0 || head.indexOf('<MPD') === 0) {
+                                            report(respUrl, document.title, '', 0, 'XHR Playlist');
+                                        } else if (ct.indexOf('application/json') >= 0 || ct.indexOf('text/plain') >= 0) {
+                                            extractFromJsonText(this.responseText, 'XHR JSON');
+                                        }
                                     }
                                 } catch (e) {}
                             });
