@@ -53,6 +53,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.browser.DetectedMedia
+import com.example.browser.MediaFormat
 import com.example.browser.MediaSniffer
 import com.example.data.local.DownloadEntity
 import com.example.data.local.DownloadStatus
@@ -192,7 +193,7 @@ fun DetectedMediaSheet(
                         modifier = Modifier.size(18.dp)
                     )
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text("Tempel URL Stream Langsung (.mp4 / .m3u8)")
+                    Text("Tempel URL Stream Langsung (.mp4 / .m3u8 / .mpd)")
                 }
             } else {
                 Row(
@@ -202,7 +203,7 @@ fun DetectedMediaSheet(
                     OutlinedTextField(
                         value = manualUrl,
                         onValueChange = { manualUrl = it },
-                        placeholder = { Text("https://.../video.mp4 atau .m3u8") },
+                        placeholder = { Text("https://.../video.mp4, .m3u8, atau .mpd") },
                         singleLine = true,
                         modifier = Modifier.weight(1f)
                     )
@@ -267,6 +268,20 @@ private fun DetectedMediaCard(
                         color = MaterialTheme.colorScheme.primary,
                         modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
                     )
+                }
+                if (media.audioUrl.isNotBlank() || media.format == MediaFormat.DASH) {
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Surface(
+                        color = MaterialTheme.colorScheme.secondaryContainer,
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text(
+                            text = "+Audio",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp)
+                        )
+                    }
                 }
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(

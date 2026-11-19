@@ -13,6 +13,7 @@ import com.example.data.local.BookmarkEntity
 import com.example.data.local.DownloadEntity
 import com.example.data.local.DownloadStatus
 import com.example.data.local.HistoryEntity
+import com.example.data.local.SearchEngine
 import com.example.data.local.StreamDatabase
 import com.example.data.local.UserPreferences
 import com.example.data.repository.StreamRepository
@@ -90,6 +91,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val totalAdsBlocked: StateFlow<Long> = preferences.totalAdsBlocked
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0L)
 
+    val searchEngine: StateFlow<SearchEngine> = preferences.searchEngine
+        .stateIn(viewModelScope, SharingStarted.Eagerly, SearchEngine.GOOGLE)
+
     val downloads: StateFlow<List<DownloadEntity>> = repository.downloads
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
@@ -128,6 +132,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val webViewCommands = _webViewCommands.asSharedFlow()
 
     private val probedUrls = ConcurrentHashMap.newKeySet<String>()
+    private val probeCandidateUrls = ConcurrentHashMap.newKeySet<String>()
 
     init {
         viewModelScope.launch {
@@ -159,6 +164,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _snackbarMessage.tryEmit(
             if (next) "Pemblokir Pop-up diaktifkan" else "Pemblokir Pop-up dinonaktifkan"
         )
+    }
+
+    fun setSearchEngine(engine: SearchEngine) {
+        viewModelScope.launch {
+            preferences.setSearchEngine(engine)
+        }
+        _snackbarMessage.tryEmit("Mesin pencari diubah ke ${engine.displayName}")
     }
 
     fun selectSection(section: AppSection) {
@@ -286,7 +298,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return if (looksLikeDomain) {
             "https://$input"
         } else {
-            "https://duckduckgo.com/?q=${Uri.encode(input)}"
+            searchEngine.value.buildSearchUrl(input)
         }
     }
 
@@ -304,13 +316,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun goBackActiveTab(): Boolean {
         val tab = _tabs.value.firstOrNull { it.id == _activeTabId.value } ?: return false
         if (tab.isHomeScreen) return false
-        return if (tab.canGoBack) {
-            _webViewCommands.tryEmit(WebViewCommand.GoBack(tab.id))
-            true
-        } else {
-            goHome()
-            true
-        }
+        _webViewCommands.tryEmit(WebViewCommand.GoBack(tab.id))
+        return true
     }
 
     fun goForwardActiveTab() {
@@ -339,6 +346,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun onPageStarted(tabId: String, url: String) {
+        val prefix = "$tabId|"
+        probeCandidateUrls.removeIf { it.startsWith(prefix) }
+        probedUrls.removeIf { it.startsWith(prefix) }
         updateTab(tabId) {
             it.copy(
                 isHomeScreen = false,
@@ -416,6 +426,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun onUrlVisited(tabId: String, url: String, canBack: Boolean, canForward: Boolean) {
+        updateTab(tabId) {
+            if (it.isHomeScreen) it else it.copy(
+                url = url,
+                canGoBack = canBack,
+                canGoForward = canForward
+            )
+        }
+    }
+
     fun onMediaSniffed(
         tabId: String,
         url: String,
@@ -424,26 +444,34 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         resolution: String,
         durationSeconds: Int,
         referer: String,
+        originHeader: String,
         userAgent: String,
         cookie: String,
-        origin: String
+        origin: String,
+        audioUrl: String = ""
     ) {
-        val format = MediaSniffer.classifyUrl(url, mimeHint) ?: return
+        val normalizedUrl = MediaSniffer.normalizeVideoUrl(url)
+        val format = MediaSniffer.classifyUrl(normalizedUrl, mimeHint) ?: return
+        val effectiveOrigin = originHeader.ifBlank { MediaSniffer.deriveOriginHeader(referer, normalizedUrl) }
         var isNewEntry = false
 
         _tabs.update { list ->
             list.map { tab ->
                 if (tab.id != tabId) return@map tab
                 val effectiveTitle = rawTitle.ifBlank {
-                    MediaSniffer.deriveTitle(url, tab.title, format)
+                    MediaSniffer.deriveTitle(normalizedUrl, tab.title, format)
                 }
-                val existingIndex = tab.detectedMedia.indexOfFirst { it.url == url }
+                val existingIndex = tab.detectedMedia.indexOfFirst { it.url == normalizedUrl }
                 if (existingIndex >= 0) {
                     val existing = tab.detectedMedia[existingIndex]
                     val enriched = existing.copy(
                         resolution = existing.resolution.ifBlank { resolution },
                         durationSeconds = if (existing.durationSeconds > 0) existing.durationSeconds else durationSeconds,
-                        title = if (rawTitle.isNotBlank()) rawTitle else existing.title
+                        title = if (rawTitle.isNotBlank()) rawTitle else existing.title,
+                        referer = existing.referer.ifBlank { referer },
+                        originHeader = existing.originHeader.ifBlank { effectiveOrigin },
+                        cookie = existing.cookie.ifBlank { cookie },
+                        audioUrl = existing.audioUrl.ifBlank { audioUrl }
                     )
                     if (enriched != existing) {
                         val updatedList = tab.detectedMedia.toMutableList().apply { set(existingIndex, enriched) }
@@ -455,7 +483,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     isNewEntry = true
                     val media = DetectedMedia(
                         id = UUID.randomUUID().toString(),
-                        url = url,
+                        url = normalizedUrl,
                         title = effectiveTitle,
                         format = format,
                         mimeType = mimeHint?.substringBefore(';')?.trim()?.takeIf { it.isNotBlank() }
@@ -463,8 +491,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         resolution = resolution,
                         durationSeconds = durationSeconds,
                         referer = referer,
+                        originHeader = effectiveOrigin,
                         userAgent = userAgent,
                         cookie = cookie,
+                        audioUrl = audioUrl,
                         sourceOrigin = origin
                     )
                     tab.copy(detectedMedia = listOf(media) + tab.detectedMedia)
@@ -472,22 +502,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // Probe file size asynchronously
-        if (isNewEntry && format != MediaFormat.HLS && format != MediaFormat.DASH && probedUrls.add(url)) {
+        // Probe file size & content-type asynchronously
+        val probeKey = "$tabId|$normalizedUrl"
+        if (isNewEntry && format != MediaFormat.HLS && format != MediaFormat.DASH && probedUrls.add(probeKey)) {
             viewModelScope.launch {
-                val (sizeBytes, probedMime) = MediaSniffer.probeMediaMetadata(
-                    url = url,
+                val probe = MediaSniffer.probeMediaMetadata(
+                    url = normalizedUrl,
                     referer = referer,
+                    originHeader = effectiveOrigin,
                     userAgent = userAgent,
                     cookie = cookie
                 )
-                if (sizeBytes > 0L || !probedMime.isNullOrBlank()) {
+                if (probe.sizeBytes > 0L || !probe.contentType.isNullOrBlank()) {
                     updateTab(tabId) { current ->
                         val updated = current.detectedMedia.map { item ->
-                            if (item.url == url) {
+                            if (item.url == normalizedUrl) {
                                 item.copy(
-                                    sizeBytes = if (sizeBytes > 0L) sizeBytes else item.sizeBytes,
-                                    mimeType = probedMime?.substringBefore(';')?.trim() ?: item.mimeType
+                                    sizeBytes = if (probe.sizeBytes > 0L) probe.sizeBytes else item.sizeBytes,
+                                    mimeType = probe.contentType?.substringBefore(';')?.trim() ?: item.mimeType
                                 )
                             } else {
                                 item
@@ -500,8 +532,68 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun onProbeCandidateFound(
+        tabId: String,
+        url: String,
+        referer: String,
+        originHeader: String,
+        userAgent: String,
+        cookie: String
+    ) {
+        val normalizedUrl = MediaSniffer.normalizeVideoUrl(url)
+        val probeKey = "$tabId|$normalizedUrl"
+        if (!probeCandidateUrls.add(probeKey)) return
+        val alreadyDetected = _tabs.value
+            .firstOrNull { it.id == tabId }
+            ?.detectedMedia
+            ?.any { it.url == normalizedUrl } == true
+        if (alreadyDetected) return
+
+        val effectiveOrigin = originHeader.ifBlank { MediaSniffer.deriveOriginHeader(referer, normalizedUrl) }
+        viewModelScope.launch {
+            val probe = MediaSniffer.probeMediaMetadata(
+                url = normalizedUrl,
+                referer = referer,
+                originHeader = effectiveOrigin,
+                userAgent = userAgent,
+                cookie = cookie
+            )
+            val ct = probe.contentType
+            if (!ct.isNullOrBlank() && MediaSniffer.classifyUrl(normalizedUrl, ct) != null) {
+                probedUrls.add(probeKey)
+                onMediaSniffed(
+                    tabId = tabId,
+                    url = normalizedUrl,
+                    rawTitle = "",
+                    mimeHint = ct,
+                    resolution = "",
+                    durationSeconds = 0,
+                    referer = referer,
+                    originHeader = effectiveOrigin,
+                    userAgent = userAgent,
+                    cookie = cookie,
+                    origin = "CDN Probe",
+                    audioUrl = ""
+                )
+                if (probe.sizeBytes > 0L) {
+                    updateTab(tabId) { current ->
+                        current.copy(
+                            detectedMedia = current.detectedMedia.map { item ->
+                                if (item.url == normalizedUrl && item.sizeBytes <= 0L) {
+                                    item.copy(sizeBytes = probe.sizeBytes)
+                                } else {
+                                    item
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     fun addManualStreamUrl(rawUrl: String) {
-        val url = rawUrl.trim()
+        val url = MediaSniffer.normalizeVideoUrl(rawUrl.trim())
         if (!url.startsWith("http://") && !url.startsWith("https://")) {
             _snackbarMessage.tryEmit("Masukkan URL http:// atau https:// yang valid")
             return
@@ -517,9 +609,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             resolution = "",
             durationSeconds = 0,
             referer = "",
+            originHeader = MediaSniffer.deriveOriginHeader("", url),
             userAgent = "",
             cookie = "",
-            origin = "Manual"
+            origin = "Manual",
+            audioUrl = ""
         )
     }
 
@@ -567,8 +661,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 status = DownloadStatus.QUEUED.name,
                 statusDetail = "Menyiapkan unduhan...",
                 referer = media.referer,
+                originHeader = media.originHeader,
                 userAgent = media.userAgent,
-                cookie = media.cookie
+                cookie = media.cookie,
+                audioUrl = media.audioUrl
             )
             val rowId = repository.insertDownload(entity)
             downloader.startDownload(entity.copy(id = rowId))

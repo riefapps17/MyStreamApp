@@ -61,6 +61,8 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.SmartDisplay
+import androidx.compose.material.icons.filled.TravelExplore
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
@@ -68,14 +70,14 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -102,7 +104,10 @@ import com.example.browser.DemoStreamPage
 import com.example.browser.MediaSniffer
 import com.example.browser.WebViewCallbacks
 import com.example.browser.createConfiguredWebView
+import com.example.browser.goBackSafely
+import com.example.browser.hasValidBackHistory
 import com.example.data.local.BookmarkEntity
+import com.example.data.local.SearchEngine
 import com.example.ui.BrowserTabState
 import com.example.ui.WebViewCommand
 import kotlinx.coroutines.flow.SharedFlow
@@ -120,6 +125,9 @@ fun BrowserScreen(
     isAdBlockEnabled: Boolean,
     isPopupBlockEnabled: Boolean,
     totalAdsBlocked: Long,
+    searchEngine: SearchEngine,
+    webViews: MutableMap<String, WebView>,
+    defaultUserAgents: MutableMap<String, String>,
     webViewCommands: SharedFlow<WebViewCommand>,
     onNavigate: (String) -> Unit,
     onReloadOrStop: () -> Unit,
@@ -129,6 +137,7 @@ fun BrowserScreen(
     onOpenMediaSheet: () -> Unit,
     onOpenTabsSheet: () -> Unit,
     onOpenShieldSheet: () -> Unit,
+    onSelectSearchEngine: (SearchEngine) -> Unit,
     onToggleDesktopMode: () -> Unit,
     onToggleBookmark: () -> Unit,
     onToggleTheme: () -> Unit,
@@ -138,7 +147,9 @@ fun BrowserScreen(
     onProgressChanged: (String, Int) -> Unit,
     onTitleChanged: (String, String) -> Unit,
     onNavigationStateChanged: (String, Boolean, Boolean) -> Unit,
-    onMediaSniffed: (String, String, String, String?, String, Int, String, String, String, String) -> Unit,
+    onUrlVisited: (String, String, Boolean, Boolean) -> Unit,
+    onMediaSniffed: (String, String, String, String?, String, Int, String, String, String, String, String, String) -> Unit,
+    onProbeCandidateFound: (String, String, String, String, String, String) -> Unit,
     onAdBlocked: (String, String, Int) -> Unit,
     onPopupBlocked: (String, String) -> Unit
 ) {
@@ -152,11 +163,9 @@ fun BrowserScreen(
         popupBlockEnabledRef.set(isPopupBlockEnabled)
     }
 
-    val webViews = remember { mutableStateMapOf<String, WebView>() }
-    val defaultUserAgents = remember { mutableStateMapOf<String, String>() }
-
     var fullscreenCustomView by remember { mutableStateOf<View?>(null) }
     var fullscreenCallback by remember { mutableStateOf<WebChromeClient.CustomViewCallback?>(null) }
+    var showSearchEngineDialog by remember { mutableStateOf(false) }
 
     val callbacks = remember {
         object : WebViewCallbacks {
@@ -183,6 +192,13 @@ fun BrowserScreen(
                 canForward: Boolean
             ) = onNavigationStateChanged(tabId, canBack, canForward)
 
+            override fun onUrlVisited(
+                tabId: String,
+                url: String,
+                canBack: Boolean,
+                canForward: Boolean
+            ) = onUrlVisited(tabId, url, canBack, canForward)
+
             override fun onMediaSniffed(
                 tabId: String,
                 url: String,
@@ -191,13 +207,24 @@ fun BrowserScreen(
                 resolution: String,
                 durationSeconds: Int,
                 referer: String,
+                originHeader: String,
                 userAgent: String,
                 cookie: String,
-                origin: String
+                origin: String,
+                audioUrl: String
             ) = onMediaSniffed(
                 tabId, url, title, mimeHint, resolution,
-                durationSeconds, referer, userAgent, cookie, origin
+                durationSeconds, referer, originHeader, userAgent, cookie, origin, audioUrl
             )
+
+            override fun onProbeCandidateFound(
+                tabId: String,
+                url: String,
+                referer: String,
+                originHeader: String,
+                userAgent: String,
+                cookie: String
+            ) = onProbeCandidateFound(tabId, url, referer, originHeader, userAgent, cookie)
 
             override fun onAdBlocked(tabId: String, blockedUrl: String, count: Int) =
                 onAdBlocked(tabId, blockedUrl, count)
@@ -231,6 +258,15 @@ fun BrowserScreen(
         }
     }
 
+    fun performSafeBack(tabId: String) {
+        val wv = webViews[tabId]
+        if (wv != null && goBackSafely(wv)) {
+            onNavigationStateChanged(tabId, hasValidBackHistory(wv), wv.canGoForward())
+        } else {
+            onGoHome()
+        }
+    }
+
     LaunchedEffect(webViewCommands) {
         webViewCommands.collect { cmd ->
             when (cmd) {
@@ -250,7 +286,7 @@ fun BrowserScreen(
                 }
                 is WebViewCommand.Reload -> webViews[cmd.tabId]?.reload()
                 is WebViewCommand.StopLoading -> webViews[cmd.tabId]?.stopLoading()
-                is WebViewCommand.GoBack -> webViews[cmd.tabId]?.goBack()
+                is WebViewCommand.GoBack -> performSafeBack(cmd.tabId)
                 is WebViewCommand.GoForward -> webViews[cmd.tabId]?.goForward()
                 is WebViewCommand.SetDesktopMode -> {
                     val wv = webViews[cmd.tabId]
@@ -277,23 +313,13 @@ fun BrowserScreen(
         }
     }
 
-    DisposableEffect(Unit) {
-        onDispose {
-            webViews.values.forEach { wv ->
-                wv.stopLoading()
-                wv.destroy()
-            }
-            webViews.clear()
-        }
-    }
-
     BackHandler(enabled = fullscreenCustomView != null || !activeTab.isHomeScreen) {
         if (fullscreenCustomView != null) {
             fullscreenCallback?.onCustomViewHidden()
             fullscreenCustomView = null
             fullscreenCallback = null
         } else {
-            onGoBack()
+            performSafeBack(activeTab.id)
         }
     }
 
@@ -365,7 +391,7 @@ fun BrowserScreen(
                                 ) {
                                     if (omniboxText.isEmpty()) {
                                         Text(
-                                            text = stringResource(R.string.omnibox_hint),
+                                            text = "Cari di ${searchEngine.displayName} atau ketik URL...",
                                             style = MaterialTheme.typography.bodyMedium,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                                             maxLines = 1,
@@ -566,6 +592,14 @@ fun BrowserScreen(
                                     }
                                 )
                                 DropdownMenuItem(
+                                    text = { Text("Mesin Pencari: ${searchEngine.displayName}") },
+                                    leadingIcon = { Icon(Icons.Default.TravelExplore, contentDescription = null) },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        showSearchEngineDialog = true
+                                    }
+                                )
+                                DropdownMenuItem(
                                     text = { Text("Buka Halaman Demo Video") },
                                     leadingIcon = { Icon(Icons.Default.SmartDisplay, contentDescription = null) },
                                     onClick = {
@@ -616,13 +650,33 @@ fun BrowserScreen(
                         bookmarks = bookmarks,
                         isAdBlockEnabled = isAdBlockEnabled,
                         totalAdsBlocked = totalAdsBlocked,
+                        searchEngine = searchEngine,
                         onOpenUrl = onNavigate,
                         onOpenDemo = { onNavigate(DemoStreamPage.DEMO_URL) },
-                        onOpenShield = onOpenShieldSheet
+                        onOpenShield = onOpenShieldSheet,
+                        onOpenSearchEnginePicker = { showSearchEngineDialog = true }
                     )
                 } else {
                     val activeWebView = remember(activeTab.id) {
                         getOrCreateWebView(activeTab.id)
+                    }
+                    LaunchedEffect(activeTab.id, activeTab.isHomeScreen, activeTab.url) {
+                        if (!activeTab.isHomeScreen &&
+                            activeTab.url.isNotBlank() &&
+                            (activeWebView.url.isNullOrBlank() || activeWebView.url == "about:blank")
+                        ) {
+                            if (activeTab.url == DemoStreamPage.DEMO_URL) {
+                                activeWebView.loadDataWithBaseURL(
+                                    DemoStreamPage.BASE_URL,
+                                    DemoStreamPage.htmlContent,
+                                    "text/html",
+                                    "utf-8",
+                                    null
+                                )
+                            } else {
+                                activeWebView.loadUrl(activeTab.url)
+                            }
+                        }
                     }
                     AndroidView(
                         factory = { ctx ->
@@ -674,7 +728,7 @@ fun BrowserScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         IconButton(
-                            onClick = { onGoBack() },
+                            onClick = { performSafeBack(activeTab.id) },
                             modifier = Modifier.testTag("browser_back_button")
                         ) {
                             Icon(
@@ -727,6 +781,48 @@ fun BrowserScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(Color.Black)
+            )
+        }
+
+        if (showSearchEngineDialog) {
+            AlertDialog(
+                onDismissRequest = { showSearchEngineDialog = false },
+                title = { Text("Pilih Mesin Pencari") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        SearchEngine.entries.forEach { engine ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .clickable {
+                                        onSelectSearchEngine(engine)
+                                        showSearchEngineDialog = false
+                                    }
+                                    .padding(horizontal = 8.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                RadioButton(
+                                    selected = engine == searchEngine,
+                                    onClick = {
+                                        onSelectSearchEngine(engine)
+                                        showSearchEngineDialog = false
+                                    }
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = engine.displayName,
+                                    style = MaterialTheme.typography.bodyLarge
+                                )
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { showSearchEngineDialog = false }) {
+                        Text("Tutup")
+                    }
+                }
             )
         }
     }
@@ -785,9 +881,11 @@ private fun BrowserHomeStartPage(
     bookmarks: List<BookmarkEntity>,
     isAdBlockEnabled: Boolean,
     totalAdsBlocked: Long,
+    searchEngine: SearchEngine,
     onOpenUrl: (String) -> Unit,
     onOpenDemo: () -> Unit,
-    onOpenShield: () -> Unit
+    onOpenShield: () -> Unit,
+    onOpenSearchEnginePicker: () -> Unit
 ) {
     Box(
         modifier = Modifier
@@ -838,15 +936,28 @@ private fun BrowserHomeStartPage(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Surface(
-                                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
-                                shape = RoundedCornerShape(999.dp)
+                                onClick = onOpenSearchEnginePicker,
+                                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.22f),
+                                shape = RoundedCornerShape(999.dp),
+                                modifier = Modifier.testTag("search_engine_chip")
                             ) {
-                                Text(
-                                    text = "STREAM SNIFFER BROWSER",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                                )
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.TravelExplore,
+                                        contentDescription = "Pilih mesin pencari",
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(13.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(
+                                        text = searchEngine.displayName.uppercase(),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
                             }
                             Surface(
                                 onClick = onOpenShield,

@@ -78,6 +78,7 @@ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.example.browser.DetectedMedia
+import com.example.browser.MediaSniffer
 import com.example.ui.PlayerTarget
 import kotlinx.coroutines.delay
 import okhttp3.OkHttpClient
@@ -125,8 +126,12 @@ fun VideoPlayerScreen(
     val exoPlayer = remember(target) {
         val builder = ExoPlayer.Builder(context)
         if (target is PlayerTarget.RemoteStream) {
+            val effectiveOrigin = target.media.originHeader.ifBlank {
+                MediaSniffer.deriveOriginHeader(target.media.referer, target.media.url)
+            }
             val headers = buildMap {
                 if (target.media.referer.isNotBlank()) put("Referer", target.media.referer)
+                if (effectiveOrigin.isNotBlank()) put("Origin", effectiveOrigin)
                 if (target.media.cookie.isNotBlank()) put("Cookie", target.media.cookie)
                 if (target.media.userAgent.isNotBlank()) put("User-Agent", target.media.userAgent)
             }

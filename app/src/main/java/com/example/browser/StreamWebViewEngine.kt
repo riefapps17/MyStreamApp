@@ -128,7 +128,8 @@ class StreamSnifferBridge(
         title: String,
         resolution: String,
         durationSeconds: Int,
-        origin: String
+        origin: String,
+        audioUrl: String
     ) -> Unit,
     private val onCosmeticAdBlocked: (count: Int) -> Unit
 ) {
@@ -138,9 +139,10 @@ class StreamSnifferBridge(
         title: String,
         resolution: String,
         durationSeconds: Int,
-        origin: String
+        origin: String,
+        audioUrl: String
     ) {
-        onMediaDetected(url, title, resolution, durationSeconds, origin)
+        onMediaDetected(url, title, resolution, durationSeconds, origin, audioUrl)
     }
 
     @JavascriptInterface
@@ -157,6 +159,7 @@ interface WebViewCallbacks {
     fun onProgressChanged(tabId: String, progress: Int)
     fun onTitleChanged(tabId: String, title: String)
     fun onNavigationStateChanged(tabId: String, canBack: Boolean, canForward: Boolean)
+    fun onUrlVisited(tabId: String, url: String, canBack: Boolean, canForward: Boolean)
     fun onMediaSniffed(
         tabId: String,
         url: String,
@@ -165,9 +168,19 @@ interface WebViewCallbacks {
         resolution: String,
         durationSeconds: Int,
         referer: String,
+        originHeader: String,
         userAgent: String,
         cookie: String,
-        origin: String
+        origin: String,
+        audioUrl: String
+    )
+    fun onProbeCandidateFound(
+        tabId: String,
+        url: String,
+        referer: String,
+        originHeader: String,
+        userAgent: String,
+        cookie: String
     )
     fun onAdBlocked(tabId: String, blockedUrl: String, count: Int = 1)
     fun onPopupBlocked(tabId: String, blockedUrl: String)
@@ -215,20 +228,28 @@ fun createConfiguredWebView(
 
         addJavascriptInterface(
             StreamSnifferBridge(
-                onMediaDetected = { mediaUrl, title, res, dur, origin ->
+                onMediaDetected = { mediaUrl, title, res, dur, origin, audioUrl ->
                     val currentPage = currentPageUrlRef.get().orEmpty()
-                    val cookie = runCatching { CookieManager.getInstance().getCookie(mediaUrl) }.getOrNull() ?: ""
+                    val normalizedUrl = MediaSniffer.normalizeVideoUrl(mediaUrl)
+                    val normalizedAudio = if (audioUrl.isNotBlank()) MediaSniffer.normalizeVideoUrl(audioUrl) else ""
+                    val originHeader = MediaSniffer.deriveOriginHeader(currentPage, normalizedUrl)
+                    val cookie = runCatching {
+                        CookieManager.getInstance().getCookie(normalizedUrl)
+                            ?: CookieManager.getInstance().getCookie(currentPage)
+                    }.getOrNull().orEmpty()
                     callbacks.onMediaSniffed(
                         tabId = tabId,
-                        url = mediaUrl,
+                        url = normalizedUrl,
                         title = title,
                         mimeHint = null,
                         resolution = res,
                         durationSeconds = dur,
                         referer = currentPage,
+                        originHeader = originHeader,
                         userAgent = defaultUserAgent,
                         cookie = cookie,
-                        origin = origin
+                        origin = origin,
+                        audioUrl = normalizedAudio
                     )
                 },
                 onCosmeticAdBlocked = { count ->
@@ -241,20 +262,26 @@ fun createConfiguredWebView(
         webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
                 super.onPageStarted(view, url, favicon)
-                val cleanUrl = if (url == DemoStreamPage.BASE_URL) DemoStreamPage.DEMO_URL else (url ?: "")
+                if (url.isNullOrBlank() || url.equals("about:blank", ignoreCase = true)) {
+                    return
+                }
+                val cleanUrl = if (url == DemoStreamPage.BASE_URL) DemoStreamPage.DEMO_URL else url
                 currentPageUrlRef.set(cleanUrl)
                 currentPageHostRef.set(runCatching { Uri.parse(cleanUrl).host.orEmpty() }.getOrDefault(""))
                 callbacks.onPageStarted(tabId, cleanUrl)
-                callbacks.onNavigationStateChanged(tabId, view.canGoBack(), view.canGoForward())
+                callbacks.onNavigationStateChanged(tabId, hasValidBackHistory(view), view.canGoForward())
             }
 
             override fun onPageFinished(view: WebView, url: String?) {
                 super.onPageFinished(view, url)
-                val cleanUrl = if (url == DemoStreamPage.BASE_URL) DemoStreamPage.DEMO_URL else (url ?: "")
+                if (url.isNullOrBlank() || url.equals("about:blank", ignoreCase = true)) {
+                    return
+                }
+                val cleanUrl = if (url == DemoStreamPage.BASE_URL) DemoStreamPage.DEMO_URL else url
                 currentPageUrlRef.set(cleanUrl)
                 currentPageHostRef.set(runCatching { Uri.parse(cleanUrl).host.orEmpty() }.getOrDefault(""))
                 val pageTitle = view.title?.takeIf { it.isNotBlank() } ?: cleanUrl
-                callbacks.onPageFinished(tabId, cleanUrl, pageTitle, view.canGoBack(), view.canGoForward())
+                callbacks.onPageFinished(tabId, cleanUrl, pageTitle, hasValidBackHistory(view), view.canGoForward())
                 view.evaluateJavascript(MediaSniffer.MEDIA_SNIFFER_JS, null)
                 if (isAdBlockEnabled()) {
                     view.evaluateJavascript(
@@ -262,6 +289,17 @@ fun createConfiguredWebView(
                         null
                     )
                 }
+            }
+
+            override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+                super.doUpdateVisitedHistory(view, url, isReload)
+                if (view == null || url.isNullOrBlank() || url.equals("about:blank", ignoreCase = true)) {
+                    return
+                }
+                val cleanUrl = if (url == DemoStreamPage.BASE_URL) DemoStreamPage.DEMO_URL else url
+                currentPageUrlRef.set(cleanUrl)
+                currentPageHostRef.set(runCatching { Uri.parse(cleanUrl).host.orEmpty() }.getOrDefault(""))
+                callbacks.onUrlVisited(tabId, cleanUrl, hasValidBackHistory(view), view.canGoForward())
             }
 
             override fun shouldOverrideUrlLoading(
@@ -299,23 +337,49 @@ fun createConfiguredWebView(
                     return AdBlockEngine.createEmptyResponse()
                 }
 
-                // 2. Run MediaSniffer to capture playable streaming URLs
+                // 2. Run MediaSniffer to capture playable streaming URLs (direct, HLS, DASH, extensionless CDN)
+                val normalizedUrl = MediaSniffer.normalizeVideoUrl(reqUrl)
                 val acceptHeader = request.requestHeaders["Accept"]
-                if (MediaSniffer.classifyUrl(reqUrl, acceptHeader) != null) {
-                    val referer = request.requestHeaders["Referer"] ?: ""
-                    val ua = request.requestHeaders["User-Agent"] ?: defaultUserAgent
-                    val cookie = runCatching { CookieManager.getInstance().getCookie(reqUrl) }.getOrNull() ?: ""
+                val rangeHeader = request.requestHeaders["Range"]
+                val secFetchDest = request.requestHeaders["Sec-Fetch-Dest"]
+                val referer = request.requestHeaders["Referer"] ?: currentPageUrlRef.get().orEmpty()
+                val originHeader = request.requestHeaders["Origin"]
+                    ?: MediaSniffer.deriveOriginHeader(referer, currentPageUrlRef.get().orEmpty())
+                val ua = request.requestHeaders["User-Agent"] ?: defaultUserAgent
+
+                if (MediaSniffer.classifyUrl(normalizedUrl, acceptHeader) != null) {
+                    val cookie = runCatching {
+                        CookieManager.getInstance().getCookie(normalizedUrl)
+                            ?: CookieManager.getInstance().getCookie(referer)
+                    }.getOrNull().orEmpty()
                     callbacks.onMediaSniffed(
                         tabId = tabId,
-                        url = reqUrl,
+                        url = normalizedUrl,
                         title = "",
                         mimeHint = acceptHeader,
                         resolution = "",
                         durationSeconds = 0,
                         referer = referer,
+                        originHeader = originHeader,
                         userAgent = ua,
                         cookie = cookie,
-                        origin = "Network"
+                        origin = "Network",
+                        audioUrl = ""
+                    )
+                } else if (!request.isForMainFrame &&
+                    MediaSniffer.isProbeCandidate(normalizedUrl, acceptHeader, rangeHeader, secFetchDest)
+                ) {
+                    val cookie = runCatching {
+                        CookieManager.getInstance().getCookie(normalizedUrl)
+                            ?: CookieManager.getInstance().getCookie(referer)
+                    }.getOrNull().orEmpty()
+                    callbacks.onProbeCandidateFound(
+                        tabId = tabId,
+                        url = normalizedUrl,
+                        referer = referer,
+                        originHeader = originHeader,
+                        userAgent = ua,
+                        cookie = cookie
                     )
                 }
                 return super.shouldInterceptRequest(view, request)
@@ -379,4 +443,54 @@ fun createConfiguredWebView(
             }
         }
     }
+}
+
+fun hasValidBackHistory(webView: WebView): Boolean {
+    val list = webView.copyBackForwardList()
+    val currentIndex = list.currentIndex
+    for (i in currentIndex - 1 downTo 0) {
+        val u = list.getItemAtIndex(i)?.url.orEmpty()
+        if (u.isNotBlank() && !u.equals("about:blank", ignoreCase = true)) {
+            return true
+        }
+    }
+    return false
+}
+
+/**
+ * Navigates back in WebView while skipping blank/empty entries and restoring the
+ * built-in Demo page cleanly instead of landing on an empty screen.
+ * Returns true if WebView navigated back to a real page, false if caller should return Home.
+ */
+fun goBackSafely(webView: WebView): Boolean {
+    val list = webView.copyBackForwardList()
+    val currentIndex = list.currentIndex
+    var targetIndex = -1
+    for (i in currentIndex - 1 downTo 0) {
+        val u = list.getItemAtIndex(i)?.url.orEmpty()
+        if (u.isNotBlank() && !u.equals("about:blank", ignoreCase = true)) {
+            targetIndex = i
+            break
+        }
+    }
+    if (targetIndex < 0) return false
+
+    val targetUrl = list.getItemAtIndex(targetIndex)?.url.orEmpty()
+    if (targetUrl == DemoStreamPage.BASE_URL) {
+        webView.loadDataWithBaseURL(
+            DemoStreamPage.BASE_URL,
+            DemoStreamPage.htmlContent,
+            "text/html",
+            "utf-8",
+            null
+        )
+        return true
+    }
+
+    val steps = targetIndex - currentIndex
+    if (webView.canGoBackOrForward(steps)) {
+        webView.goBackOrForward(steps)
+        return true
+    }
+    return false
 }

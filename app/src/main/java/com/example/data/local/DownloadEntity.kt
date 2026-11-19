@@ -30,7 +30,9 @@ data class DownloadEntity(
     val statusDetail: String = "",
     val errorMessage: String? = null,
     val referer: String = "",
+    val originHeader: String = "",
     val userAgent: String = "",
     val cookie: String = "",
+    val audioUrl: String = "",
     val createdAt: Long = System.currentTimeMillis()
 )

@@ -1,7 +1,10 @@
 package com.example
 
+import android.app.Activity
 import android.os.Bundle
+import android.webkit.WebView
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.Box
@@ -30,15 +33,22 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import kotlinx.coroutines.launch
 import com.example.data.local.DownloadStatus
 import com.example.player.VideoPlayerScreen
 import com.example.ui.AppSection
@@ -84,7 +94,27 @@ private fun StreamVaultApp(
     val isAdBlockEnabled by viewModel.isAdBlockEnabled.collectAsStateWithLifecycle()
     val isPopupBlockEnabled by viewModel.isPopupBlockingEnabled.collectAsStateWithLifecycle()
     val totalAdsBlocked by viewModel.totalAdsBlocked.collectAsStateWithLifecycle()
+    val searchEngine by viewModel.searchEngine.collectAsStateWithLifecycle()
     val playerTarget by viewModel.playerTarget.collectAsStateWithLifecycle()
+
+    val context = LocalContext.current
+    val activity = context as? Activity
+    val coroutineScope = rememberCoroutineScope()
+
+    // Hoisted WebView registry so switching between Browser / Vault / Bookmarks preserves open pages & back history
+    val webViews = remember { mutableStateMapOf<String, WebView>() }
+    val defaultUserAgents = remember { mutableStateMapOf<String, String>() }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            webViews.values.forEach { wv ->
+                wv.stopLoading()
+                wv.destroy()
+            }
+            webViews.clear()
+            defaultUserAgents.clear()
+        }
+    }
 
     val activeTab = tabs.firstOrNull { it.id == activeTabId } ?: tabs.firstOrNull() ?: BrowserTabState()
     val activeDownloadsCount = downloads.count {
@@ -95,6 +125,24 @@ private fun StreamVaultApp(
     LaunchedEffect(viewModel.snackbarMessage) {
         viewModel.snackbarMessage.collect { msg ->
             snackbarHostState.showSnackbar(msg)
+        }
+    }
+
+    // Root BackHandler: return from Vault/Bookmarks to Browser, or require double-back on Home before exiting
+    var lastExitBackPressMs by remember { mutableLongStateOf(0L) }
+    BackHandler(enabled = playerTarget == null && (currentSection != AppSection.BROWSER || activeTab.isHomeScreen)) {
+        if (currentSection != AppSection.BROWSER) {
+            viewModel.selectSection(AppSection.BROWSER)
+        } else {
+            val now = System.currentTimeMillis()
+            if (now - lastExitBackPressMs < 2000L) {
+                activity?.finish()
+            } else {
+                lastExitBackPressMs = now
+                coroutineScope.launch {
+                    snackbarHostState.showSnackbar("Tekan kembali sekali lagi untuk keluar")
+                }
+            }
         }
     }
 
@@ -246,6 +294,9 @@ private fun StreamVaultApp(
                                     isAdBlockEnabled = isAdBlockEnabled,
                                     isPopupBlockEnabled = isPopupBlockEnabled,
                                     totalAdsBlocked = totalAdsBlocked,
+                                    searchEngine = searchEngine,
+                                    webViews = webViews,
+                                    defaultUserAgents = defaultUserAgents,
                                     webViewCommands = viewModel.webViewCommands,
                                     onNavigate = { viewModel.navigateToInput(it) },
                                     onReloadOrStop = { viewModel.reloadOrStopActiveTab() },
@@ -255,6 +306,7 @@ private fun StreamVaultApp(
                                     onOpenMediaSheet = { viewModel.openMediaSheet() },
                                     onOpenTabsSheet = { viewModel.openTabsSheet() },
                                     onOpenShieldSheet = { viewModel.openShieldSheet() },
+                                    onSelectSearchEngine = { viewModel.setSearchEngine(it) },
                                     onToggleDesktopMode = { viewModel.toggleDesktopMode() },
                                     onToggleBookmark = { viewModel.toggleBookmarkCurrentPage() },
                                     onToggleTheme = { viewModel.toggleTheme() },
@@ -264,7 +316,9 @@ private fun StreamVaultApp(
                                     onProgressChanged = viewModel::onProgressChanged,
                                     onTitleChanged = viewModel::onTitleChanged,
                                     onNavigationStateChanged = viewModel::onNavigationStateChanged,
+                                    onUrlVisited = viewModel::onUrlVisited,
                                     onMediaSniffed = viewModel::onMediaSniffed,
+                                    onProbeCandidateFound = viewModel::onProbeCandidateFound,
                                     onAdBlocked = viewModel::onAdBlocked,
                                     onPopupBlocked = viewModel::onPopupBlocked
                                 )
