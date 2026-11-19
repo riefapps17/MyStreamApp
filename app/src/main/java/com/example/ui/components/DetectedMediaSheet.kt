@@ -1,21 +1,26 @@
 package com.example.ui.components
 
 import android.net.Uri
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
@@ -27,6 +32,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
@@ -42,19 +48,29 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.example.R
 import com.example.browser.DetectedMedia
 import com.example.browser.MediaFormat
 import com.example.browser.MediaSniffer
+import com.example.browser.VideoPreviewResult
+import com.example.browser.VideoThumbnailLoader
 import com.example.data.local.DownloadEntity
 import com.example.data.local.DownloadStatus
 
@@ -62,6 +78,7 @@ import com.example.data.local.DownloadStatus
 @Composable
 fun DetectedMediaSheet(
     detectedMedia: List<DetectedMedia>,
+    pageFallbackThumbnail: String,
     downloads: List<DownloadEntity>,
     onDismiss: () -> Unit,
     onRescan: () -> Unit,
@@ -110,7 +127,7 @@ fun DetectedMediaSheet(
                         style = MaterialTheme.typography.titleLarge
                     )
                     Text(
-                        text = "${detectedMedia.size} aliran video tertangkap di halaman ini",
+                        text = "${detectedMedia.size} aliran video tertangkap • Ketuk pratinjau untuk cek",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -160,16 +177,17 @@ fun DetectedMediaSheet(
                 }
             } else {
                 LazyColumn(
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
                     contentPadding = PaddingValues(vertical = 4.dp),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height((detectedMedia.size.coerceAtMost(3) * 142).dp.coerceAtLeast(140.dp))
+                        .heightIn(min = 148.dp, max = 460.dp)
                 ) {
                     items(detectedMedia, key = { it.id }) { media ->
                         val matchingDownload = downloads.firstOrNull { it.sourceUrl == media.url }
                         DetectedMediaCard(
                             media = media,
+                            pageFallbackThumbnail = pageFallbackThumbnail,
                             existingDownload = matchingDownload,
                             onPlay = { onPlayStream(media) },
                             onSave = { onSaveStream(media) }
@@ -225,9 +243,15 @@ fun DetectedMediaSheet(
     }
 }
 
+private sealed interface ThumbnailLoadState {
+    data object Loading : ThumbnailLoadState
+    data class Ready(val result: VideoPreviewResult) : ThumbnailLoadState
+}
+
 @Composable
 private fun DetectedMediaCard(
     media: DetectedMedia,
+    pageFallbackThumbnail: String,
     existingDownload: DownloadEntity?,
     onPlay: () -> Unit,
     onSave: () -> Unit
@@ -235,10 +259,41 @@ private fun DetectedMediaCard(
     val host = remember(media.url) {
         runCatching { Uri.parse(media.url).host }.getOrNull().orEmpty()
     }
-    val metaParts = remember(media) {
+
+    val hasRemotePoster = media.thumbnailUrl.startsWith("http://", ignoreCase = true) ||
+        media.thumbnailUrl.startsWith("https://", ignoreCase = true)
+
+    val frameState by produceState<ThumbnailLoadState>(
+        initialValue = VideoThumbnailLoader.getCached(media.url)
+            ?.let { ThumbnailLoadState.Ready(it) }
+            ?: if (hasRemotePoster) {
+                ThumbnailLoadState.Ready(VideoPreviewResult(null))
+            } else {
+                ThumbnailLoadState.Loading
+            },
+        key1 = media.url,
+        key2 = media.thumbnailUrl
+    ) {
+        if (!hasRemotePoster) {
+            val result = VideoThumbnailLoader.loadPreview(media)
+            value = ThumbnailLoadState.Ready(result)
+        }
+    }
+
+    val extractedPreview = (frameState as? ThumbnailLoadState.Ready)?.result
+    val effectiveDuration = if (media.durationSeconds > 0) {
+        media.durationSeconds
+    } else {
+        extractedPreview?.durationSeconds ?: 0
+    }
+    val effectiveResolution = media.resolution.ifBlank {
+        extractedPreview?.resolution.orEmpty()
+    }
+
+    val metaParts = remember(media, effectiveDuration, effectiveResolution) {
         buildList {
-            if (media.resolution.isNotBlank()) add(media.resolution)
-            if (media.durationSeconds > 0) add(MediaSniffer.formatDuration(media.durationSeconds))
+            if (effectiveResolution.isNotBlank()) add(effectiveResolution)
+            if (effectiveDuration > 0) add(MediaSniffer.formatDuration(effectiveDuration))
             if (media.sizeBytes > 0) add(MediaSniffer.formatBytes(media.sizeBytes))
             add(media.sourceOrigin)
         }.joinToString(" • ")
@@ -256,53 +311,77 @@ private fun DetectedMediaCard(
             .fillMaxWidth()
             .testTag("detected_media_card")
     ) {
-        Column(modifier = Modifier.padding(14.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Surface(
-                    color = MaterialTheme.colorScheme.primaryContainer,
-                    shape = RoundedCornerShape(8.dp)
-                ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Row(
+                verticalAlignment = Alignment.Top,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                // Visual Video Thumbnail Preview (tap to quick-preview in native player)
+                VideoThumbnailPreview(
+                    media = media,
+                    hasRemotePoster = hasRemotePoster,
+                    frameState = frameState,
+                    pageFallbackThumbnail = pageFallbackThumbnail,
+                    durationSeconds = effectiveDuration,
+                    onClick = onPlay
+                )
+
+                Spacer(modifier = Modifier.width(12.dp))
+
+                Column(modifier = Modifier.weight(1f)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.primaryContainer,
+                            shape = RoundedCornerShape(6.dp)
+                        ) {
+                            Text(
+                                text = media.format.label,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                        if (media.audioUrl.isNotBlank() || media.format == MediaFormat.DASH) {
+                            Surface(
+                                color = MaterialTheme.colorScheme.secondaryContainer,
+                                shape = RoundedCornerShape(6.dp)
+                            ) {
+                                Text(
+                                    text = "+Audio",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(6.dp))
+
                     Text(
-                        text = media.format.label,
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                        text = media.title,
+                        style = MaterialTheme.typography.titleSmall,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+
+                    Spacer(modifier = Modifier.height(4.dp))
+
+                    Text(
+                        text = if (host.isNotBlank()) "$host • $metaParts" else metaParts,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
-                if (media.audioUrl.isNotBlank() || media.format == MediaFormat.DASH) {
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Surface(
-                        color = MaterialTheme.colorScheme.secondaryContainer,
-                        shape = RoundedCornerShape(8.dp)
-                    ) {
-                        Text(
-                            text = "+Audio",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSecondaryContainer,
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp)
-                        )
-                    }
-                }
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = media.title,
-                    style = MaterialTheme.typography.titleMedium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
-                )
             }
 
-            Spacer(modifier = Modifier.height(6.dp))
-            Text(
-                text = if (host.isNotBlank()) "$host • $metaParts" else metaParts,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
+            Spacer(modifier = Modifier.height(10.dp))
 
-            Spacer(modifier = Modifier.height(12.dp))
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -357,6 +436,143 @@ private fun DetectedMediaCard(
                         }
                     )
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun VideoThumbnailPreview(
+    media: DetectedMedia,
+    hasRemotePoster: Boolean,
+    frameState: ThumbnailLoadState,
+    pageFallbackThumbnail: String,
+    durationSeconds: Int,
+    onClick: () -> Unit
+) {
+    val context = LocalContext.current
+    val extractedBitmap = (frameState as? ThumbnailLoadState.Ready)?.result?.bitmap
+    val fallbackUrl = pageFallbackThumbnail.takeIf {
+        it.startsWith("http://", ignoreCase = true) || it.startsWith("https://", ignoreCase = true)
+    }
+    val remoteImageUrl = when {
+        hasRemotePoster -> media.thumbnailUrl
+        extractedBitmap == null && frameState is ThumbnailLoadState.Ready && fallbackUrl != null -> fallbackUrl
+        else -> null
+    }
+
+    val imageRequest = remember(remoteImageUrl, media.referer, media.userAgent, media.cookie) {
+        remoteImageUrl?.let { imgUrl ->
+            ImageRequest.Builder(context)
+                .data(imgUrl)
+                .crossfade(true)
+                .apply {
+                    if (media.referer.isNotBlank()) addHeader("Referer", media.referer)
+                    if (media.userAgent.isNotBlank()) addHeader("User-Agent", media.userAgent)
+                    if (media.cookie.isNotBlank()) addHeader("Cookie", media.cookie)
+                }
+                .build()
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .width(124.dp)
+            .height(78.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(
+                Brush.linearGradient(
+                    colors = listOf(
+                        MaterialTheme.colorScheme.surfaceContainerHigh,
+                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f)
+                    )
+                )
+            )
+            .clickable(onClick = onClick)
+            .testTag("detected_media_thumbnail"),
+        contentAlignment = Alignment.Center
+    ) {
+        when {
+            extractedBitmap != null -> {
+                Image(
+                    bitmap = extractedBitmap.asImageBitmap(),
+                    contentDescription = "Pratinjau ${media.title}",
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+            imageRequest != null -> {
+                AsyncImage(
+                    model = imageRequest,
+                    contentDescription = "Thumbnail ${media.title}",
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+            frameState is ThumbnailLoadState.Loading -> {
+                CircularProgressIndicator(
+                    strokeWidth = 2.dp,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(22.dp)
+                )
+            }
+            else -> {
+                Icon(
+                    imageVector = Icons.Default.Videocam,
+                    contentDescription = "Ikon video",
+                    tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.75f),
+                    modifier = Modifier.size(28.dp)
+                )
+            }
+        }
+
+        // Subtle scrim for play button & duration readability
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(
+                            Color.Transparent,
+                            Color(0x99000000)
+                        )
+                    )
+                )
+        )
+
+        // Centered Play badge so users know tapping previews the video
+        if (frameState !is ThumbnailLoadState.Loading) {
+            Box(
+                modifier = Modifier
+                    .size(30.dp)
+                    .clip(CircleShape)
+                    .background(Color(0x99000000)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Default.PlayArrow,
+                    contentDescription = "Pratinjau video",
+                    tint = Color.White,
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+        }
+
+        // Bottom-right duration badge
+        if (durationSeconds > 0) {
+            Surface(
+                color = Color(0xCC000000),
+                shape = RoundedCornerShape(5.dp),
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(5.dp)
+            ) {
+                Text(
+                    text = MediaSniffer.formatDuration(durationSeconds),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color.White,
+                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                )
             }
         }
     }

@@ -2,7 +2,9 @@ package com.example.ui
 
 import android.app.Application
 import android.net.Uri
+import android.webkit.CookieManager
 import android.webkit.URLUtil
+import android.webkit.WebStorage
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.browser.DemoStreamPage
@@ -48,6 +50,7 @@ data class BrowserTabState(
     val canGoForward: Boolean = false,
     val isDesktopMode: Boolean = false,
     val detectedMedia: List<DetectedMedia> = emptyList(),
+    val pageThumbnailUrl: String = "",
     val blockedAdsCount: Int = 0,
     val blockedPopupsCount: Int = 0
 )
@@ -66,6 +69,7 @@ sealed interface WebViewCommand {
     data class SetDesktopMode(val tabId: String, val enabled: Boolean) : WebViewCommand
     data class RescanDom(val tabId: String) : WebViewCommand
     data class DestroyTab(val tabId: String) : WebViewCommand
+    data class ClearWebViewData(val clearCache: Boolean, val clearCookiesAndLogin: Boolean) : WebViewCommand
 }
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -124,6 +128,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _isSearchEngineSheetOpen = MutableStateFlow(false)
     val isSearchEngineSheetOpen: StateFlow<Boolean> = _isSearchEngineSheetOpen.asStateFlow()
+
+    private val _isClearDataSheetOpen = MutableStateFlow(false)
+    val isClearDataSheetOpen: StateFlow<Boolean> = _isClearDataSheetOpen.asStateFlow()
 
     private val _playerTarget = MutableStateFlow<PlayerTarget?>(null)
     val playerTarget: StateFlow<PlayerTarget?> = _playerTarget.asStateFlow()
@@ -213,6 +220,51 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _isSearchEngineSheetOpen.value = false
     }
 
+    fun openClearDataSheet() {
+        _isClearDataSheetOpen.value = true
+    }
+
+    fun closeClearDataSheet() {
+        _isClearDataSheetOpen.value = false
+    }
+
+    fun clearBrowsingData(
+        clearCache: Boolean,
+        clearHistory: Boolean,
+        clearCookiesAndLogin: Boolean
+    ) {
+        viewModelScope.launch {
+            if (clearHistory) {
+                repository.clearHistory()
+            }
+            if (clearCookiesAndLogin) {
+                runCatching {
+                    val cm = CookieManager.getInstance()
+                    cm.removeAllCookies(null)
+                    cm.flush()
+                }
+                runCatching {
+                    WebStorage.getInstance().deleteAllData()
+                }
+                repository.clearAllStoredCookies()
+            }
+            _webViewCommands.tryEmit(
+                WebViewCommand.ClearWebViewData(
+                    clearCache = clearCache,
+                    clearCookiesAndLogin = clearCookiesAndLogin
+                )
+            )
+            val msg = when {
+                clearCookiesAndLogin -> "Cookie, data login, dan data terpilih berhasil dihapus"
+                clearCache && clearHistory -> "Cache & riwayat dibersihkan (data login tetap disimpan)"
+                clearCache -> "Cache browser dibersihkan (data login tetap disimpan)"
+                clearHistory -> "Riwayat kunjungan dihapus (data login tetap disimpan)"
+                else -> "Tidak ada data yang dipilih"
+            }
+            _snackbarMessage.tryEmit(msg)
+        }
+    }
+
     fun createNewTab(initialUrl: String? = null) {
         val newTab = BrowserTabState()
         _tabs.update { it + newTab }
@@ -259,6 +311,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 isLoading = false,
                 progress = 0,
                 detectedMedia = emptyList(),
+                pageThumbnailUrl = "",
                 blockedAdsCount = 0,
                 blockedPopupsCount = 0
             )
@@ -367,6 +420,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 isLoading = true,
                 progress = 10,
                 detectedMedia = emptyList(),
+                pageThumbnailUrl = "",
                 blockedAdsCount = 0,
                 blockedPopupsCount = 0
             )
@@ -447,6 +501,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun onPagePosterFound(tabId: String, posterUrl: String) {
+        if (posterUrl.isBlank()) return
+        updateTab(tabId) { tab ->
+            if (tab.pageThumbnailUrl.isBlank()) tab.copy(pageThumbnailUrl = posterUrl) else tab
+        }
+    }
+
     fun onMediaSniffed(
         tabId: String,
         url: String,
@@ -459,7 +520,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         userAgent: String,
         cookie: String,
         origin: String,
-        audioUrl: String = ""
+        audioUrl: String = "",
+        thumbnailUrl: String = ""
     ) {
         val normalizedUrl = MediaSniffer.normalizeVideoUrl(url)
         val format = MediaSniffer.classifyUrl(normalizedUrl, mimeHint) ?: return
@@ -482,7 +544,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         referer = existing.referer.ifBlank { referer },
                         originHeader = existing.originHeader.ifBlank { effectiveOrigin },
                         cookie = existing.cookie.ifBlank { cookie },
-                        audioUrl = existing.audioUrl.ifBlank { audioUrl }
+                        audioUrl = existing.audioUrl.ifBlank { audioUrl },
+                        thumbnailUrl = existing.thumbnailUrl.ifBlank { thumbnailUrl }
                     )
                     if (enriched != existing) {
                         val updatedList = tab.detectedMedia.toMutableList().apply { set(existingIndex, enriched) }
@@ -506,6 +569,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         userAgent = userAgent,
                         cookie = cookie,
                         audioUrl = audioUrl,
+                        thumbnailUrl = thumbnailUrl,
                         sourceOrigin = origin
                     )
                     tab.copy(detectedMedia = listOf(media) + tab.detectedMedia)

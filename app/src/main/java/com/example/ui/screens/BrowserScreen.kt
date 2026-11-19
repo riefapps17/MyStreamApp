@@ -47,9 +47,13 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.BookmarkBorder
+import androidx.compose.material.icons.filled.Bookmarks
+import androidx.compose.material.icons.filled.CleaningServices
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.DesktopWindows
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.GppGood
 import androidx.compose.material.icons.filled.GppMaybe
 import androidx.compose.material.icons.filled.Home
@@ -107,6 +111,7 @@ import com.example.browser.goBackSafely
 import com.example.browser.hasValidBackHistory
 import com.example.data.local.BookmarkEntity
 import com.example.data.local.SearchEngine
+import com.example.ui.AppSection
 import com.example.ui.BrowserTabState
 import com.example.ui.WebViewCommand
 import kotlinx.coroutines.flow.SharedFlow
@@ -120,6 +125,8 @@ fun BrowserScreen(
     activeTab: BrowserTabState,
     tabCount: Int,
     bookmarks: List<BookmarkEntity>,
+    activeDownloadsCount: Int,
+    completedDownloadsCount: Int,
     isDarkTheme: Boolean,
     isAdBlockEnabled: Boolean,
     isPopupBlockEnabled: Boolean,
@@ -128,6 +135,7 @@ fun BrowserScreen(
     webViews: MutableMap<String, WebView>,
     defaultUserAgents: MutableMap<String, String>,
     webViewCommands: SharedFlow<WebViewCommand>,
+    onSelectSection: (AppSection) -> Unit,
     onNavigate: (String) -> Unit,
     onReloadOrStop: () -> Unit,
     onGoBack: () -> Boolean,
@@ -137,6 +145,7 @@ fun BrowserScreen(
     onOpenTabsSheet: () -> Unit,
     onOpenShieldSheet: () -> Unit,
     onOpenSearchEngineSheet: () -> Unit,
+    onOpenClearDataSheet: () -> Unit,
     onSelectSearchEngine: (SearchEngine) -> Unit,
     onToggleDesktopMode: () -> Unit,
     onToggleBookmark: () -> Unit,
@@ -148,7 +157,8 @@ fun BrowserScreen(
     onTitleChanged: (String, String) -> Unit,
     onNavigationStateChanged: (String, Boolean, Boolean) -> Unit,
     onUrlVisited: (String, String, Boolean, Boolean) -> Unit,
-    onMediaSniffed: (String, String, String, String?, String, Int, String, String, String, String, String, String) -> Unit,
+    onPagePosterFound: (String, String) -> Unit,
+    onMediaSniffed: (String, String, String, String?, String, Int, String, String, String, String, String, String, String) -> Unit,
     onProbeCandidateFound: (String, String, String, String, String, String) -> Unit,
     onAdBlocked: (String, String, Int) -> Unit,
     onPopupBlocked: (String, String) -> Unit
@@ -198,6 +208,9 @@ fun BrowserScreen(
                 canForward: Boolean
             ) = onUrlVisited(tabId, url, canBack, canForward)
 
+            override fun onPagePosterFound(tabId: String, posterUrl: String) =
+                onPagePosterFound(tabId, posterUrl)
+
             override fun onMediaSniffed(
                 tabId: String,
                 url: String,
@@ -210,10 +223,11 @@ fun BrowserScreen(
                 userAgent: String,
                 cookie: String,
                 origin: String,
-                audioUrl: String
+                audioUrl: String,
+                thumbnailUrl: String
             ) = onMediaSniffed(
                 tabId, url, title, mimeHint, resolution,
-                durationSeconds, referer, originHeader, userAgent, cookie, origin, audioUrl
+                durationSeconds, referer, originHeader, userAgent, cookie, origin, audioUrl, thumbnailUrl
             )
 
             override fun onProbeCandidateFound(
@@ -307,6 +321,16 @@ fun BrowserScreen(
                         destroy()
                     }
                     defaultUserAgents.remove(cmd.tabId)
+                }
+                is WebViewCommand.ClearWebViewData -> {
+                    webViews.values.forEach { wv ->
+                        if (cmd.clearCache) {
+                            wv.clearCache(true)
+                        }
+                        if (cmd.clearCookiesAndLogin) {
+                            wv.clearFormData()
+                        }
+                    }
                 }
             }
         }
@@ -521,21 +545,106 @@ fun BrowserScreen(
                             }
                         }
 
-                        // Overflow Menu
+                        // Overflow Menu (contains Jelajah, Tersimpan, Penanda + Browser Tools)
                         Box {
                             IconButton(
                                 onClick = { showOverflowMenu = true },
                                 modifier = Modifier.testTag("browser_menu_button")
                             ) {
-                                Icon(
-                                    imageVector = Icons.Default.MoreVert,
-                                    contentDescription = "Menu browser"
-                                )
+                                Box(contentAlignment = Alignment.Center) {
+                                    Icon(
+                                        imageVector = Icons.Default.MoreVert,
+                                        contentDescription = "Menu browser"
+                                    )
+                                    if (activeDownloadsCount > 0) {
+                                        Surface(
+                                            color = MaterialTheme.colorScheme.primary,
+                                            shape = CircleShape,
+                                            modifier = Modifier
+                                                .align(Alignment.TopEnd)
+                                                .size(9.dp)
+                                        ) {}
+                                    }
+                                }
                             }
                             DropdownMenu(
                                 expanded = showOverflowMenu,
                                 onDismissRequest = { showOverflowMenu = false }
                             ) {
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            text = if (activeTab.isHomeScreen) {
+                                                "${stringResource(R.string.nav_browser)} • Aktif"
+                                            } else {
+                                                "${stringResource(R.string.nav_browser)} (Beranda)"
+                                            },
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                    },
+                                    leadingIcon = {
+                                        Icon(
+                                            Icons.Default.Explore,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.primary
+                                        )
+                                    },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        if (!activeTab.isHomeScreen) {
+                                            onGoHome()
+                                        }
+                                        onSelectSection(AppSection.BROWSER)
+                                    },
+                                    modifier = Modifier.testTag("menu_nav_browser")
+                                )
+                                DropdownMenuItem(
+                                    text = {
+                                        val label = when {
+                                            activeDownloadsCount > 0 ->
+                                                "${stringResource(R.string.nav_vault)} ($activeDownloadsCount mengunduh)"
+                                            completedDownloadsCount > 0 ->
+                                                "${stringResource(R.string.nav_vault)} ($completedDownloadsCount video)"
+                                            else -> stringResource(R.string.nav_vault)
+                                        }
+                                        Text(label)
+                                    },
+                                    leadingIcon = {
+                                        Icon(
+                                            Icons.Default.Download,
+                                            contentDescription = null,
+                                            tint = if (activeDownloadsCount > 0) {
+                                                MaterialTheme.colorScheme.primary
+                                            } else {
+                                                MaterialTheme.colorScheme.onSurfaceVariant
+                                            }
+                                        )
+                                    },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        onSelectSection(AppSection.VAULT)
+                                    },
+                                    modifier = Modifier.testTag("menu_nav_vault")
+                                )
+                                DropdownMenuItem(
+                                    text = {
+                                        val label = if (bookmarks.isNotEmpty()) {
+                                            "${stringResource(R.string.nav_bookmarks)} & Riwayat (${bookmarks.size})"
+                                        } else {
+                                            "${stringResource(R.string.nav_bookmarks)} & Riwayat"
+                                        }
+                                        Text(label)
+                                    },
+                                    leadingIcon = {
+                                        Icon(Icons.Default.Bookmarks, contentDescription = null)
+                                    },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        onSelectSection(AppSection.BOOKMARKS)
+                                    },
+                                    modifier = Modifier.testTag("menu_nav_bookmarks")
+                                )
+                                HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
                                 DropdownMenuItem(
                                     text = { Text("Mesin Pencari: ${searchEngine.displayName}") },
                                     leadingIcon = { Icon(Icons.Default.TravelExplore, contentDescription = null) },
@@ -615,6 +724,15 @@ fun BrowserScreen(
                                         showOverflowMenu = false
                                         onNavigate(DemoStreamPage.DEMO_URL)
                                     }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Privasi & Hapus Data") },
+                                    leadingIcon = { Icon(Icons.Default.CleaningServices, contentDescription = null) },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        onOpenClearDataSheet()
+                                    },
+                                    modifier = Modifier.testTag("menu_clear_data")
                                 )
                                 DropdownMenuItem(
                                     text = {

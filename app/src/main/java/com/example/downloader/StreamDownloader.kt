@@ -526,14 +526,57 @@ class StreamDownloader(
             return
         }
 
-        downloadHlsMediaSegments(entity, parsed, targetFile, isFmp4 = isFmp4, progressMin = 1, progressMax = 99, label = "Segmen")
+        if (!isFmp4) {
+            val tempTs = File(getTempDir(), "hls_raw_${entity.id}.ts")
+            val mp4FileName = entity.fileName.substringBeforeLast('.') + ".mp4"
+            val mp4TargetFile = File(getVideosDir(), mp4FileName)
+            try {
+                downloadHlsMediaSegments(entity, parsed, tempTs, isFmp4 = false, progressMin = 1, progressMax = 92, label = "Segmen")
+
+                repository.updateDownloadProgress(
+                    id = entity.id,
+                    status = DownloadStatus.DOWNLOADING.name,
+                    downloadedBytes = tempTs.length(),
+                    totalBytes = tempTs.length(),
+                    progressPercent = 95,
+                    statusDetail = "Mengemas ke MP4 agar muncul di Galeri..."
+                )
+
+                val remuxed = MediaMuxerHelper.remuxToMp4(tempTs, mp4TargetFile)
+                if (remuxed) {
+                    finalizeDownload(
+                        entity = entity,
+                        targetFile = mp4TargetFile,
+                        fileName = mp4FileName,
+                        mimeType = "video/mp4",
+                        exportedDetail = "HLS MP4 tersimpan di Galeri",
+                        offlineDetail = "HLS MP4 tersimpan offline"
+                    )
+                } else {
+                    tempTs.copyTo(targetFile, overwrite = true)
+                    finalizeDownload(
+                        entity = entity,
+                        targetFile = targetFile,
+                        fileName = finalFileName,
+                        mimeType = finalMime,
+                        exportedDetail = "HLS tersimpan di Galeri/Unduhan",
+                        offlineDetail = "HLS tersimpan offline"
+                    )
+                }
+            } finally {
+                runCatching { tempTs.delete() }
+            }
+            return
+        }
+
+        downloadHlsMediaSegments(entity, parsed, targetFile, isFmp4 = true, progressMin = 1, progressMax = 99, label = "Segmen")
 
         finalizeDownload(
             entity = entity,
             targetFile = targetFile,
             fileName = finalFileName,
             mimeType = finalMime,
-            exportedDetail = "HLS digabung & disimpan",
+            exportedDetail = "HLS tersimpan di Galeri",
             offlineDetail = "HLS tersimpan offline"
         )
     }
@@ -738,49 +781,123 @@ class StreamDownloader(
     fun exportExistingToGallery(entity: DownloadEntity): Uri? {
         val file = File(entity.localPath)
         if (!file.exists()) return null
-        val uri = exportToDeviceGallery(file, entity.fileName, entity.mimeType)
-        if (uri != null) {
-            scope.launch {
-                repository.updateMediaStoreUri(entity.id, uri.toString())
+
+        var exportFile = file
+        var exportFileName = entity.fileName
+        var exportMime = entity.mimeType
+        var tempRemux: File? = null
+
+        // If an older HLS .ts video is being exported manually, remux to .mp4 so Gallery displays it
+        if (exportMime == "video/mp2t" || exportFileName.endsWith(".ts", ignoreCase = true)) {
+            val candidate = File(getTempDir(), "export_${entity.id}.mp4")
+            if (MediaMuxerHelper.remuxToMp4(file, candidate)) {
+                tempRemux = candidate
+                exportFile = candidate
+                exportFileName = exportFileName.substringBeforeLast('.') + ".mp4"
+                exportMime = "video/mp4"
             }
         }
-        return uri
+
+        return try {
+            val uri = exportToDeviceGallery(exportFile, exportFileName, exportMime)
+            if (uri != null) {
+                scope.launch {
+                    repository.updateMediaStoreUri(entity.id, uri.toString())
+                }
+            }
+            uri
+        } finally {
+            runCatching { tempRemux?.delete() }
+        }
     }
 
     private fun exportToDeviceGallery(file: File, fileName: String, mimeType: String): Uri? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
+
+        val normalizedMime = when {
+            mimeType.startsWith("video/", ignoreCase = true) -> mimeType.lowercase()
+            fileName.endsWith(".webm", ignoreCase = true) -> "video/webm"
+            fileName.endsWith(".mkv", ignoreCase = true) -> "video/x-matroska"
+            fileName.endsWith(".mov", ignoreCase = true) -> "video/quicktime"
+            fileName.endsWith(".ts", ignoreCase = true) -> "video/mp2t"
+            else -> "video/mp4"
+        }
+
+        // Primary: insert directly into MediaStore.Video.Media (Movies/StreamVault) with DATE_TAKEN
+        // so Android 10-16 Gallery / Google Photos indexes and displays it immediately at the top.
+        val galleryUri = insertIntoMediaStore(
+            file = file,
+            fileName = fileName,
+            mimeType = normalizedMime,
+            collection = MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+            relativePath = "${Environment.DIRECTORY_MOVIES}/StreamVault",
+            includeVideoTimestamps = true
+        )
+        if (galleryUri != null) return galleryUri
+
+        // Fallback for rare video containers rejected by MediaStore.Video.Media
+        return insertIntoMediaStore(
+            file = file,
+            fileName = fileName,
+            mimeType = normalizedMime,
+            collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+            relativePath = "${Environment.DIRECTORY_DOWNLOADS}/StreamVault",
+            includeVideoTimestamps = false
+        )
+    }
+
+    private fun insertIntoMediaStore(
+        file: File,
+        fileName: String,
+        mimeType: String,
+        collection: Uri,
+        relativePath: String,
+        includeVideoTimestamps: Boolean
+    ): Uri? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
+        val resolver = context.contentResolver
+        var insertedUri: Uri? = null
         return runCatching {
-            val resolver = context.contentResolver
-            val useVideoCollection = mimeType == "video/mp4" || mimeType == "video/webm"
-            val collection = if (useVideoCollection) {
-                MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-            } else {
-                MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-            }
-            val relativePath = if (useVideoCollection) {
-                "${Environment.DIRECTORY_MOVIES}/StreamVault"
-            } else {
-                "${Environment.DIRECTORY_DOWNLOADS}/StreamVault"
-            }
+            val nowMs = System.currentTimeMillis()
+            val nowSec = nowMs / 1000L
+            val title = fileName.substringBeforeLast('.').ifBlank { "StreamVault_Video" }
 
             val values = ContentValues().apply {
                 put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                put(MediaStore.MediaColumns.TITLE, title)
                 put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
                 put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
+                put(MediaStore.MediaColumns.DATE_ADDED, nowSec)
+                put(MediaStore.MediaColumns.DATE_MODIFIED, nowSec)
+                if (includeVideoTimestamps) {
+                    put(MediaStore.Video.Media.DATE_TAKEN, nowMs)
+                }
                 put(MediaStore.MediaColumns.IS_PENDING, 1)
             }
 
             val itemUri = resolver.insert(collection, values) ?: return@runCatching null
-            resolver.openOutputStream(itemUri)?.use { out ->
+            insertedUri = itemUri
+
+            val outputStream = resolver.openOutputStream(itemUri)
+                ?: throw IllegalStateException("Tidak dapat membuka MediaStore OutputStream")
+            outputStream.use { out ->
                 file.inputStream().use { input ->
                     input.copyTo(out)
                 }
+                out.flush()
             }
-            values.clear()
-            values.put(MediaStore.MediaColumns.IS_PENDING, 0)
-            resolver.update(itemUri, values, null, null)
+
+            val doneValues = ContentValues().apply {
+                put(MediaStore.MediaColumns.IS_PENDING, 0)
+                put(MediaStore.MediaColumns.SIZE, file.length())
+                put(MediaStore.MediaColumns.DATE_MODIFIED, System.currentTimeMillis() / 1000L)
+            }
+            resolver.update(itemUri, doneValues, null, null)
             itemUri
-        }.getOrNull()
+        }.getOrElse {
+            insertedUri?.let { uri -> runCatching { resolver.delete(uri, null, null) } }
+            null
+        }
     }
 
     fun shareSavedVideo(entity: DownloadEntity) {

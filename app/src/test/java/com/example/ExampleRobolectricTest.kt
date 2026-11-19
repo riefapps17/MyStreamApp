@@ -304,4 +304,11 @@ class ExampleRobolectricTest {
             )
         )
     }
+
+    @Test
+    fun `videoThumbnailLoader safely ignores invalid data urls`() {
+        assertNull(com.example.browser.VideoThumbnailLoader.decodeBase64DataUrl(""))
+        assertNull(com.example.browser.VideoThumbnailLoader.decodeBase64DataUrl("https://example.com/poster.jpg"))
+        assertNull(com.example.browser.VideoThumbnailLoader.decodeBase64DataUrl("data:image/jpeg;base64,"))
+    }
 }

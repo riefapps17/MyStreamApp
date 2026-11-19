@@ -128,5 +128,9 @@ class StreamRepository(
         downloadDao.updateMediaStoreUri(id, uri)
     }
 
+    suspend fun clearAllStoredCookies() {
+        downloadDao.clearAllStoredCookies()
+    }
+
     suspend fun deleteDownload(id: Long) = downloadDao.deleteById(id)
 }

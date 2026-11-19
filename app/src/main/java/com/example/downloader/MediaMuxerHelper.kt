@@ -81,6 +81,91 @@ object MediaMuxerHelper {
         }
     }
 
+    /**
+     * Remuxes a single container (such as an assembled HLS .ts MPEG-TS stream) into a
+     * standard Gallery-compatible MP4 container without re-encoding video or audio.
+     */
+    fun remuxToMp4(inputFile: File, outputFile: File): Boolean {
+        val extractor = MediaExtractor()
+        var muxer: MediaMuxer? = null
+        return try {
+            extractor.setDataSource(inputFile.absolutePath)
+            val trackMap = mutableMapOf<Int, Int>()
+            var maxBufferSize = 1024 * 1024
+            var hasVideo = false
+
+            if (outputFile.exists()) outputFile.delete()
+            muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+
+            for (i in 0 until extractor.trackCount) {
+                val format = extractor.getTrackFormat(i)
+                val mime = format.getString(MediaFormat.KEY_MIME).orEmpty()
+                if (mime.startsWith("video/") || mime.startsWith("audio/")) {
+                    val addedTrack = runCatching { muxer.addTrack(format) }.getOrElse { -1 }
+                    if (addedTrack >= 0) {
+                        trackMap[i] = addedTrack
+                        extractor.selectTrack(i)
+                        if (mime.startsWith("video/")) hasVideo = true
+                        maxBufferSize = maxOf(maxBufferSize, getMaxInputSize(format, 512 * 1024))
+                    }
+                }
+            }
+
+            if (!hasVideo || trackMap.isEmpty()) {
+                runCatching { outputFile.delete() }
+                return false
+            }
+
+            muxer.start()
+
+            val buffer = ByteBuffer.allocate(maxBufferSize.coerceAtMost(4 * 1024 * 1024))
+            val bufferInfo = MediaCodec.BufferInfo()
+            val lastPtsByTrack = mutableMapOf<Int, Long>()
+
+            while (true) {
+                val srcTrack = extractor.sampleTrackIndex
+                if (srcTrack < 0) break
+                val dstTrack = trackMap[srcTrack]
+                if (dstTrack == null) {
+                    extractor.advance()
+                    continue
+                }
+
+                buffer.clear()
+                val sampleSize = extractor.readSampleData(buffer, 0)
+                if (sampleSize < 0) break
+
+                val rawPts = extractor.sampleTime
+                if (rawPts < 0L) {
+                    extractor.advance()
+                    continue
+                }
+
+                // Ensure strictly non-decreasing timestamps per track (required by MediaMuxer for MPEG-TS)
+                val prevPts = lastPtsByTrack[dstTrack]
+                val safePts = if (prevPts != null && rawPts <= prevPts) prevPts + 1L else rawPts
+                lastPtsByTrack[dstTrack] = safePts
+
+                bufferInfo.offset = 0
+                bufferInfo.size = sampleSize
+                bufferInfo.presentationTimeUs = safePts
+                bufferInfo.flags = mapExtractorFlagsToCodecFlags(extractor.sampleFlags)
+
+                muxer.writeSampleData(dstTrack, buffer, bufferInfo)
+                extractor.advance()
+            }
+
+            muxer.stop()
+            outputFile.exists() && outputFile.length() > 0L
+        } catch (_: Exception) {
+            runCatching { outputFile.delete() }
+            false
+        } finally {
+            runCatching { muxer?.release() }
+            runCatching { extractor.release() }
+        }
+    }
+
     private fun selectTrack(extractor: MediaExtractor, mimePrefix: String): Int {
         for (i in 0 until extractor.trackCount) {
             val format = extractor.getTrackFormat(i)
@@ -107,20 +192,24 @@ object MediaMuxerHelper {
         buffer: ByteBuffer,
         bufferInfo: MediaCodec.BufferInfo
     ) {
+        var lastPts: Long? = null
         while (true) {
             buffer.clear()
             val sampleSize = extractor.readSampleData(buffer, 0)
             if (sampleSize < 0) break
 
-            val sampleTime = extractor.sampleTime
-            if (sampleTime < 0L) {
+            val rawPts = extractor.sampleTime
+            if (rawPts < 0L) {
                 extractor.advance()
                 continue
             }
 
+            val safePts = if (lastPts != null && rawPts <= lastPts) lastPts + 1L else rawPts
+            lastPts = safePts
+
             bufferInfo.offset = 0
             bufferInfo.size = sampleSize
-            bufferInfo.presentationTimeUs = sampleTime
+            bufferInfo.presentationTimeUs = safePts
             bufferInfo.flags = mapExtractorFlagsToCodecFlags(extractor.sampleFlags)
 
             muxer.writeSampleData(muxTrackIndex, buffer, bufferInfo)

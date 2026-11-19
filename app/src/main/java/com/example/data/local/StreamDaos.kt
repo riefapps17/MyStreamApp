@@ -39,7 +39,7 @@ interface DownloadDao {
         "UPDATE downloads SET status = :status, localPath = :localPath, fileName = :fileName, " +
             "mimeType = :mimeType, totalBytes = :totalBytes, downloadedBytes = :totalBytes, " +
             "progressPercent = 100, statusDetail = :statusDetail, mediaStoreUri = :mediaStoreUri, " +
-            "errorMessage = NULL WHERE id = :id"
+            "cookie = '', errorMessage = NULL WHERE id = :id"
     )
     suspend fun markCompleted(
         id: Long,
@@ -54,6 +54,9 @@ interface DownloadDao {
 
     @Query("UPDATE downloads SET mediaStoreUri = :uri WHERE id = :id")
     suspend fun updateMediaStoreUri(id: Long, uri: String)
+
+    @Query("UPDATE downloads SET cookie = ''")
+    suspend fun clearAllStoredCookies()
 
     @Query("DELETE FROM downloads WHERE id = :id")
     suspend fun deleteById(id: Long)

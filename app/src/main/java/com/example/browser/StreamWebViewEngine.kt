@@ -129,8 +129,10 @@ class StreamSnifferBridge(
         resolution: String,
         durationSeconds: Int,
         origin: String,
-        audioUrl: String
+        audioUrl: String,
+        thumbnailUrl: String
     ) -> Unit,
+    private val onPagePosterDetected: (posterUrl: String) -> Unit,
     private val onCosmeticAdBlocked: (count: Int) -> Unit
 ) {
     @JavascriptInterface
@@ -140,9 +142,17 @@ class StreamSnifferBridge(
         resolution: String,
         durationSeconds: Int,
         origin: String,
-        audioUrl: String
+        audioUrl: String,
+        thumbnailUrl: String
     ) {
-        onMediaDetected(url, title, resolution, durationSeconds, origin, audioUrl)
+        onMediaDetected(url, title, resolution, durationSeconds, origin, audioUrl, thumbnailUrl)
+    }
+
+    @JavascriptInterface
+    fun onPagePosterFound(posterUrl: String) {
+        if (posterUrl.isNotBlank()) {
+            onPagePosterDetected(posterUrl)
+        }
     }
 
     @JavascriptInterface
@@ -160,6 +170,7 @@ interface WebViewCallbacks {
     fun onTitleChanged(tabId: String, title: String)
     fun onNavigationStateChanged(tabId: String, canBack: Boolean, canForward: Boolean)
     fun onUrlVisited(tabId: String, url: String, canBack: Boolean, canForward: Boolean)
+    fun onPagePosterFound(tabId: String, posterUrl: String)
     fun onMediaSniffed(
         tabId: String,
         url: String,
@@ -172,7 +183,8 @@ interface WebViewCallbacks {
         userAgent: String,
         cookie: String,
         origin: String,
-        audioUrl: String
+        audioUrl: String,
+        thumbnailUrl: String
     )
     fun onProbeCandidateFound(
         tabId: String,
@@ -230,7 +242,7 @@ fun createConfiguredWebView(
 
         addJavascriptInterface(
             StreamSnifferBridge(
-                onMediaDetected = { mediaUrl, title, res, dur, origin, audioUrl ->
+                onMediaDetected = { mediaUrl, title, res, dur, origin, audioUrl, thumbUrl ->
                     val currentPage = currentPageUrlRef.get().orEmpty()
                     val normalizedUrl = MediaSniffer.normalizeVideoUrl(mediaUrl)
                     val normalizedAudio = if (audioUrl.isNotBlank()) MediaSniffer.normalizeVideoUrl(audioUrl) else ""
@@ -251,8 +263,12 @@ fun createConfiguredWebView(
                         userAgent = defaultUserAgent,
                         cookie = cookie,
                         origin = origin,
-                        audioUrl = normalizedAudio
+                        audioUrl = normalizedAudio,
+                        thumbnailUrl = thumbUrl
                     )
+                },
+                onPagePosterDetected = { posterUrl ->
+                    callbacks.onPagePosterFound(tabId, posterUrl)
                 },
                 onCosmeticAdBlocked = { count ->
                     callbacks.onAdBlocked(tabId, currentPageUrlRef.get().orEmpty(), count)
@@ -366,7 +382,8 @@ fun createConfiguredWebView(
                         userAgent = ua,
                         cookie = cookie,
                         origin = "Network",
-                        audioUrl = ""
+                        audioUrl = "",
+                        thumbnailUrl = ""
                     )
                 } else if (!request.isForMainFrame &&
                     MediaSniffer.isProbeCandidate(normalizedUrl, acceptHeader, rangeHeader, secFetchDest)

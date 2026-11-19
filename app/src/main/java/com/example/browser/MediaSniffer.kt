@@ -32,6 +32,7 @@ data class DetectedMedia(
     val userAgent: String = "",
     val cookie: String = "",
     val audioUrl: String = "",
+    val thumbnailUrl: String = "",
     val sourceOrigin: String = "Network",
     val detectedAt: Long = System.currentTimeMillis()
 )
@@ -560,13 +561,71 @@ object MediaSniffer {
                         .trim();
                 }
 
-                function report(url, title, res, dur, origin, audioUrl) {
+                function resolveAbsUrl(raw, baseDoc) {
+                    try {
+                        var clean = unescapeJsonUrl(raw);
+                        if (!clean) return '';
+                        if (clean.indexOf('data:image/') === 0) return clean;
+                        return new URL(clean, (baseDoc && baseDoc.location && baseDoc.location.href) || window.location.href).href;
+                    } catch (e) {
+                        return '';
+                    }
+                }
+
+                function getPagePoster(doc) {
+                    try {
+                        var d = doc || document;
+                        var m = d.querySelector('meta[property="og:image"], meta[property="og:image:secure_url"], meta[name="twitter:image"], meta[name="twitter:image:src"], link[rel="image_src"]');
+                        var c = m ? (m.getAttribute('content') || m.getAttribute('href') || '') : '';
+                        return resolveAbsUrl(c, d);
+                    } catch (e) {
+                        return '';
+                    }
+                }
+
+                function captureVideoThumb(v, doc) {
+                    try {
+                        var posterAttr = v.getAttribute('poster') || v.poster || '';
+                        if (posterAttr) {
+                            var resolved = resolveAbsUrl(posterAttr, doc);
+                            if (resolved) return resolved;
+                        }
+                        // Check nearby poster <img> inside player container
+                        var parent = v.parentElement;
+                        if (parent) {
+                            var img = parent.querySelector('img[src]');
+                            if (img && img.src && img.naturalWidth >= 80) {
+                                return resolveAbsUrl(img.src, doc);
+                            }
+                        }
+                        // Same-origin loaded video canvas snapshot (fails silently on cross-origin)
+                        if (v.readyState >= 2 && v.videoWidth > 0 && v.videoHeight > 0) {
+                            var c = (doc || document).createElement('canvas');
+                            var targetW = 240;
+                            var targetH = Math.max(90, Math.round((v.videoHeight / v.videoWidth) * targetW));
+                            c.width = targetW;
+                            c.height = targetH;
+                            var ctx = c.getContext('2d');
+                            if (ctx) {
+                                ctx.drawImage(v, 0, 0, targetW, targetH);
+                                var dataUrl = c.toDataURL('image/jpeg', 0.55);
+                                if (dataUrl && dataUrl.length > 200 && dataUrl.length < 90000) {
+                                    return dataUrl;
+                                }
+                            }
+                        }
+                    } catch (e) {}
+                    return '';
+                }
+
+                function report(url, title, res, dur, origin, audioUrl, thumbUrl) {
                     try {
                         var clean = unescapeJsonUrl(url);
                         if (!clean || clean.indexOf('http') !== 0) return;
                         if (clean.indexOf('blob:') === 0 || clean.indexOf('data:') === 0) return;
                         if (clean.length > 2200) return;
-                        var key = clean + '|' + (audioUrl || '');
+                        var cleanThumb = thumbUrl ? (thumbUrl.indexOf('data:image/') === 0 ? thumbUrl : unescapeJsonUrl(thumbUrl)) : '';
+                        var key = clean + '|' + (audioUrl || '') + '|' + (cleanThumb ? '1' : '0');
                         if (window.__svReported.has(key)) return;
                         window.__svReported.add(key);
 
@@ -577,7 +636,8 @@ object MediaSniffer {
                                 res || '',
                                 Math.floor(dur || 0),
                                 origin || 'DOM',
-                                unescapeJsonUrl(audioUrl || '')
+                                unescapeJsonUrl(audioUrl || ''),
+                                cleanThumb
                             );
                         }
                     } catch (e) {}
@@ -586,6 +646,13 @@ object MediaSniffer {
                 function extractFromJsonText(text, sourceLabel) {
                     try {
                         if (!text || text.length < 24 || text.length > 1800000) return;
+
+                        // Try finding a cover/poster URL inside the same JSON payload
+                        var jsonPoster = '';
+                        var coverMatch = /["']?(?:poster|thumbnailUrl|thumbnail_url|origin_cover|dynamic_cover|cover|display_url|image_url)["']?\s*:\s*["'](https?:[^"'\\]*(?:\\.[^"'\\]*)*)["']/i.exec(text);
+                        if (coverMatch && coverMatch[1]) {
+                            jsonPoster = unescapeJsonUrl(coverMatch[1]);
+                        }
 
                         // 1. Keyed social & player video fields (TikTok, IG, FB, X, JWPlayer, Plyr, VideoJS)
                         var keyedRegex = /["']?(?:playAddr|downloadAddr|play_addr|video_url|playable_url_quality_hd|playable_url|browser_native_hd_url|browser_native_sd_url|hls_url|dash_manifest|manifest_url|contentUrl|hd_src|sd_src|fallback_url|videoUrl|streamUrl|hlsUrl|mp4Url|file|src)["']?\s*:\s*["'](https?:[^"'\\]*(?:\\.[^"'\\]*)*)["']/gi;
@@ -598,7 +665,7 @@ object MediaSniffer {
                                 (/\.(m3u8|mpd|mp4|webm|mkv|mov)(\?|#|$)/i.test(found) ||
                                     /hls|m3u8|mpd|video|play|stream|manifest|playlist|tos-|cdninstagram|fbcdn|twimg/i.test(found))
                             ) {
-                                report(found, document.title, '', 0, sourceLabel);
+                                report(found, document.title, '', 0, sourceLabel, '', jsonPoster);
                                 count++;
                             }
                         }
@@ -613,7 +680,7 @@ object MediaSniffer {
                             while ((im = igUrlRegex.exec(slice)) !== null && igCount < 4) {
                                 var igUrl = unescapeJsonUrl(im[1]);
                                 if (igUrl && !/\.(jpg|jpeg|png|webp)(\?|$)/i.test(igUrl)) {
-                                    report(igUrl, document.title, '', 0, 'IG JSON');
+                                    report(igUrl, document.title, '', 0, 'IG JSON', '', jsonPoster);
                                     igCount++;
                                 }
                             }
@@ -626,7 +693,7 @@ object MediaSniffer {
                         while ((dm = directRegex.exec(text)) !== null && dCount < 12) {
                             var dUrl = unescapeJsonUrl(dm[1]);
                             if (dUrl && dUrl.indexOf('mime=audio') < 0) {
-                                report(dUrl, document.title, '', 0, sourceLabel);
+                                report(dUrl, document.title, '', 0, sourceLabel, '', jsonPoster);
                                 dCount++;
                             }
                         }
@@ -636,30 +703,38 @@ object MediaSniffer {
                 function scanDocument(doc) {
                     try {
                         if (!doc) return;
+                        var pagePoster = getPagePoster(doc);
+                        if (pagePoster && doc === document && window.StreamVaultBridge && window.StreamVaultBridge.onPagePosterFound) {
+                            window.StreamVaultBridge.onPagePosterFound(pagePoster);
+                        }
+
                         var videos = doc.querySelectorAll('video');
                         videos.forEach(function(v) {
                             var res = (v.videoWidth && v.videoHeight) ? (v.videoWidth + 'x' + v.videoHeight) : '';
                             var dur = isFinite(v.duration) ? v.duration : 0;
                             var label = v.getAttribute('title') || v.getAttribute('aria-label') || doc.title || document.title;
-                            if (v.currentSrc) report(v.currentSrc, label, res, dur, 'DOM <video>');
-                            if (v.src) report(v.src, label, res, dur, 'DOM <video>');
+                            var thumb = captureVideoThumb(v, doc);
+                            if (v.currentSrc) report(v.currentSrc, label, res, dur, 'DOM <video>', '', thumb);
+                            if (v.src) report(v.src, label, res, dur, 'DOM <video>', '', thumb);
                             var sources = v.querySelectorAll('source');
                             sources.forEach(function(s) {
-                                if (s.src) report(s.src, label, res, dur, 'DOM <source>');
+                                if (s.src) report(s.src, label, res, dur, 'DOM <source>', '', thumb);
                             });
                         });
 
                         var metas = doc.querySelectorAll('meta[property="og:video"], meta[property="og:video:url"], meta[property="og:video:secure_url"], meta[name="twitter:player:stream"]');
                         metas.forEach(function(m) {
                             var c = m.getAttribute('content');
-                            if (c) report(c, document.title, '', 0, 'Meta Video');
+                            if (c) report(c, document.title, '', 0, 'Meta Video', '', pagePoster);
                         });
 
                         var anchors = doc.querySelectorAll('a[href]');
                         anchors.forEach(function(a) {
                             var href = a.href || '';
                             if (/\.(mp4|m3u8|mpd|webm|mkv|mov)(\?|#|$)/i.test(href)) {
-                                report(href, a.textContent.trim() || document.title, '', 0, 'Link');
+                                var aImg = a.querySelector('img[src]');
+                                var aThumb = aImg ? resolveAbsUrl(aImg.src, doc) : '';
+                                report(href, a.textContent.trim() || document.title, '', 0, 'Link', '', aThumb);
                             }
                         });
 

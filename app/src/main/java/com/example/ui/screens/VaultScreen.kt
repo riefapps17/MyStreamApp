@@ -19,11 +19,16 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Bookmarks
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.DownloadDone
 import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.Explore
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.PlayArrow
@@ -31,6 +36,8 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -42,6 +49,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -58,10 +66,14 @@ import com.example.R
 import com.example.browser.MediaSniffer
 import com.example.data.local.DownloadEntity
 import com.example.data.local.DownloadStatus
+import com.example.ui.AppSection
 
 @Composable
 fun VaultScreen(
     downloads: List<DownloadEntity>,
+    bookmarksCount: Int,
+    onNavigateBack: () -> Unit,
+    onSelectSection: (AppSection) -> Unit,
     onPlay: (DownloadEntity) -> Unit,
     onCancel: (Long) -> Unit,
     onRetry: (DownloadEntity) -> Unit,
@@ -70,6 +82,7 @@ fun VaultScreen(
     onDelete: (DownloadEntity) -> Unit
 ) {
     var selectedFilter by remember { mutableIntStateOf(0) } // 0=Semua, 1=Aktif, 2=Selesai
+    var showNavMenu by remember { mutableStateOf(false) }
 
     val filtered = remember(downloads, selectedFilter) {
         when (selectedFilter) {
@@ -100,23 +113,87 @@ fun VaultScreen(
                 .fillMaxSize()
                 .padding(horizontal = 16.dp)
         ) {
-            Spacer(modifier = Modifier.height(14.dp))
+            Spacer(modifier = Modifier.height(10.dp))
 
-            // Studio Header Summary
+            // Studio Header Summary with Back & Section Overflow Menu
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                IconButton(
+                    onClick = onNavigateBack,
+                    modifier = Modifier.testTag("vault_back_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = "Kembali ke Jelajah"
+                    )
+                }
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = "Brankas Video",
-                        style = MaterialTheme.typography.headlineMedium
+                        style = MaterialTheme.typography.headlineSmall
                     )
                     Text(
                         text = "$completedCount video offline • ${MediaSniffer.formatBytes(totalSavedBytes)}",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                }
+                Box {
+                    IconButton(
+                        onClick = { showNavMenu = true },
+                        modifier = Modifier.testTag("vault_menu_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.MoreVert,
+                            contentDescription = "Menu navigasi"
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = showNavMenu,
+                        onDismissRequest = { showNavMenu = false }
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.nav_browser)) },
+                            leadingIcon = { Icon(Icons.Default.Explore, contentDescription = null) },
+                            onClick = {
+                                showNavMenu = false
+                                onSelectSection(AppSection.BROWSER)
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    "${stringResource(R.string.nav_vault)} • Aktif",
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            },
+                            leadingIcon = {
+                                Icon(
+                                    Icons.Default.Download,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
+                            },
+                            onClick = { showNavMenu = false }
+                        )
+                        DropdownMenuItem(
+                            text = {
+                                val label = if (bookmarksCount > 0) {
+                                    "${stringResource(R.string.nav_bookmarks)} & Riwayat ($bookmarksCount)"
+                                } else {
+                                    "${stringResource(R.string.nav_bookmarks)} & Riwayat"
+                                }
+                                Text(label)
+                            },
+                            leadingIcon = { Icon(Icons.Default.Bookmarks, contentDescription = null) },
+                            onClick = {
+                                showNavMenu = false
+                                onSelectSection(AppSection.BOOKMARKS)
+                            }
+                        )
+                    }
                 }
             }
 
