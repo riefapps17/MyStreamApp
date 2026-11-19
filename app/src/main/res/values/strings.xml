@@ -1,0 +1,26 @@
+<resources>
+    <string name="app_name">StreamVault</string>
+    <string name="nav_browser">Jelajah</string>
+    <string name="nav_vault">Tersimpan</string>
+    <string name="nav_bookmarks">Penanda</string>
+    <string name="omnibox_hint">Ketik URL video atau cari...</string>
+    <string name="media_detected_singular">1 Video Terdeteksi</string>
+    <string name="media_detected_plural">%1$d Video Terdeteksi</string>
+    <string name="action_scan_page">Pindai Media</string>
+    <string name="action_play_native">Putar di Player</string>
+    <string name="action_save_video">Simpan Video</string>
+    <string name="action_export_gallery">Ekspor ke Galeri</string>
+    <string name="action_share_video">Bagikan</string>
+    <string name="action_delete">Hapus</string>
+    <string name="action_retry">Coba Lagi</string>
+    <string name="action_cancel">Batal</string>
+    <string name="empty_vault_title">Belum Ada Video Tersimpan</string>
+    <string name="empty_vault_subtitle">Putar video di tab Jelajah. StreamVault mendeteksi stream video secara otomatis meski situs tidak menyediakan tombol unduh.</string>
+    <string name="empty_sniffer_title">Belum Ada Stream Terdeteksi</string>
+    <string name="empty_sniffer_subtitle">Putar video pada halaman web terlebih dahulu agar StreamVault dapat menangkap URL aliran video (MP4, WebM, atau HLS).</string>
+    <string name="adblock_shield_title">Perisai AdBlock</string>
+    <string name="adblock_active">Perlindungan Aktif</string>
+    <string name="adblock_paused">Perlindungan Dijeda</string>
+    <string name="adblock_toggle_ads">Blokir Iklan &amp; Pelacak</string>
+    <string name="adblock_toggle_popups">Blokir Pop-up &amp; Redirect</string>
+</resources>

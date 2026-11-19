@@ -1,0 +1,6 @@
+{
+  "name": "StreamVault",
+  "description": "Browser pemutar video streaming dengan deteksi media otomatis dan penyimpan video offline.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
