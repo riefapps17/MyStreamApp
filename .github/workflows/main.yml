@@ -40,6 +40,14 @@ jobs:
               -dname "CN=Android Debug,O=Android,C=US"
           fi
 
+      - name: Clean stale legacy AdShield files
+        run: |
+          rm -f app/src/main/java/com/example/ui/components/AdShieldSheet.kt
+          for f in $(grep -rl "AdShieldBlockType\|BlockedThreatEvent" app/src 2>/dev/null || true); do
+            echo "Removing stale file: $f"
+            rm -f "$f"
+          done
+
       - name: Build Debug APK
         run: gradle assembleDebug --stacktrace
 
