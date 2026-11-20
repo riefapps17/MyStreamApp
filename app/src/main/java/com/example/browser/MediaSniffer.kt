@@ -103,13 +103,79 @@ object MediaSniffer {
     )
 
     /**
-     * Removes MSE byte-range query parameters (bytestart/byteend) so IG/FB/YouTube
-     * chunked requests resolve to the full downloadable video URL instead of a tiny slice.
+     * Minimum size (300 KB) for a standalone direct video file (MP4/WebM/MKV/MOV).
+     * Files smaller than this are fMP4/DASH initialization headers (init.mp4), MSE micro-chunks,
+     * or unplayable sub-segments of the main stream. (Does not apply to HLS/DASH text manifests.)
+     */
+    const val MIN_PLAYABLE_VIDEO_BYTES: Long = 300 * 1024L
+
+    private val segmentExtensions = setOf(
+        "ts", "m4s", "m4f", "cmfv", "cmfa", "cmft", "fmp4", "ismv", "isma", "mp4v", "mp4a", "m2ts", "mts"
+    )
+
+    private val initOrChunkFileRegex = Regex(
+        """(^|[/_.-])(init|header|map|seg|segment|chunk|frag|fragment)s?(\d+|[-_.][a-z0-9]+)*\.(mp4|m4v|webm|m4s|mp4v)(\?|#|$)""",
+        RegexOption.IGNORE_CASE
+    )
+
+    private val chunkPathOrQueryRegex = Regex(
+        """(/seg(ment)?s?/|/chunks?/|/frag(ment)?s?/|[?&](seg|segment|chunk|frag|fragment|sq|seg_no|segment_index)=\d+)""",
+        RegexOption.IGNORE_CASE
+    )
+
+    private val byteRangeValueRegex = Regex("""^(bytes=)?\d+-\d+$""", RegexOption.IGNORE_CASE)
+
+    fun isTinyOrFragmentSize(format: MediaFormat, sizeBytes: Long): Boolean {
+        if (format == MediaFormat.HLS || format == MediaFormat.DASH) return false
+        return sizeBytes in 1L until MIN_PLAYABLE_VIDEO_BYTES
+    }
+
+    /**
+     * Detects whether a URL or MIME hint represents an unplayable sub-segment, initialization
+     * header (e.g. init.mp4), or MSE fragment that belongs to a parent HLS/DASH/chunked video.
+     */
+    fun isLikelyMediaSegmentOrFragment(url: String, hintMime: String? = null): Boolean {
+        if (url.isBlank()) return true
+        val lower = url.lowercase(Locale.US)
+        val mime = hintMime?.lowercase(Locale.US).orEmpty()
+
+        if (mime.contains("video/mp2t") ||
+            mime.contains("video/iso.segment") ||
+            mime.contains("audio/mp2t")
+        ) {
+            return true
+        }
+
+        val uri = runCatching { Uri.parse(url) }.getOrNull() ?: return false
+        val path = (uri.path ?: "").lowercase(Locale.US)
+        val fileName = path.substringAfterLast('/', "")
+        val ext = fileName.substringAfterLast('.', "")
+            .substringBefore('?')
+            .substringBefore('#')
+
+        if (ext in segmentExtensions) return true
+
+        // Skip fMP4/DASH initialization files (init.mp4, init-stream0.mp4, header.mp4) and numbered segment .mp4 chunks
+        if (initOrChunkFileRegex.containsMatchIn(fileName)) return true
+
+        // Skip numbered chunk paths or segment query parameters unless it is an HLS/DASH manifest
+        if (ext != "m3u8" && ext != "mpd" && !mime.contains("mpegurl") && !mime.contains("dash+xml")) {
+            if (chunkPathOrQueryRegex.containsMatchIn(lower)) return true
+        }
+
+        return false
+    }
+
+    /**
+     * Removes MSE byte-range query parameters (bytestart/byteend/range/bytes) so IG/FB/YouTube/CDN
+     * chunked requests resolve to the full downloadable video URL instead of a tiny unplayable slice.
      */
     fun normalizeVideoUrl(url: String): String {
         val trimmed = url.trim()
         if (!trimmed.contains("bytestart=", ignoreCase = true) &&
-            !trimmed.contains("byteend=", ignoreCase = true)
+            !trimmed.contains("byteend=", ignoreCase = true) &&
+            !trimmed.contains("range=", ignoreCase = true) &&
+            !trimmed.contains("bytes=", ignoreCase = true)
         ) {
             return trimmed
         }
@@ -119,7 +185,13 @@ object MediaSniffer {
             for (name in uri.queryParameterNames) {
                 val lower = name.lowercase(Locale.US)
                 if (lower == "bytestart" || lower == "byteend") continue
-                uri.getQueryParameters(name).forEach { value ->
+                val values = uri.getQueryParameters(name)
+                if ((lower == "range" || lower == "bytes") &&
+                    values.any { byteRangeValueRegex.matches(it.trim()) }
+                ) {
+                    continue
+                }
+                values.forEach { value ->
                     builder.appendQueryParameter(name, value)
                 }
             }
@@ -207,8 +279,8 @@ object MediaSniffer {
             .substringBefore('?')
             .substringBefore('#')
 
-        // Skip single HLS/DASH segment chunks (we want the playlist, not individual .ts/.m4s chunks)
-        if (ext == "ts" || ext == "m4s") {
+        // Skip single HLS/DASH/fMP4 segment chunks & init headers (we want the main video/playlist, not tiny fragments)
+        if (isLikelyMediaSegmentOrFragment(url, hintMime)) {
             return null
         }
 
@@ -216,7 +288,7 @@ object MediaSniffer {
         if (normalized.contains("mime=audio") ||
             normalized.contains("mime%3daudio") ||
             normalized.contains("mime_type=audio") ||
-            ext == "m4a" || ext == "mp3" || ext == "aac" || ext == "ogg"
+            ext == "m4a" || ext == "mp3" || ext == "aac" || ext == "ogg" || ext == "opus" || ext == "wav"
         ) {
             return null
         }
@@ -334,7 +406,11 @@ object MediaSniffer {
             .substringBefore('?')
             .substringBefore('#')
 
-        if (ext in ignoredExtensions || ext == "ts" || ext == "m4s" || ext == "html" || ext == "htm") {
+        if (ext in ignoredExtensions ||
+            ext == "html" ||
+            ext == "htm" ||
+            isLikelyMediaSegmentOrFragment(url, acceptHeader)
+        ) {
             return false
         }
         if (AdBlockEngine.isAdHost(host)) return false
@@ -344,15 +420,16 @@ object MediaSniffer {
             return false
         }
 
+        // Reject mid-stream byte-range chunk fetches (Range header present but not starting at byte 0)
+        if (!rangeHeader.isNullOrBlank()) {
+            return rangeHeader.trim().startsWith("bytes=0-", ignoreCase = true)
+        }
+
         val dest = secFetchDest?.lowercase(Locale.US).orEmpty()
         if (dest == "video") return true
 
         val accept = acceptHeader?.lowercase(Locale.US).orEmpty()
         if (accept.contains("video/") || accept.contains("mpegurl") || accept.contains("dash+xml")) return true
-
-        if (!rangeHeader.isNullOrBlank() && rangeHeader.startsWith("bytes=", ignoreCase = true)) {
-            return true
-        }
 
         // Disguised HLS/DASH/MP4 endpoints (.txt, .php, extensionless) with streaming path hints
         val hasStreamKeyword = streamPathKeywords.any { path.contains(it) || fullLower.contains("?$it") || fullLower.contains("&$it") }
@@ -456,10 +533,12 @@ object MediaSniffer {
                         ?.trim()
                         ?.toLongOrNull()
                         ?: -1L
-                    val contentLength = if (totalFromRange > 0L) {
-                        totalFromRange
-                    } else {
-                        response.header("Content-Length")?.toLongOrNull() ?: -1L
+                    // IMPORTANT: On 206 Partial Content, Content-Length is just the 256-byte range slice,
+                    // NOT the total video file size. Only trust Content-Length on 200 OK responses.
+                    var contentLength = when {
+                        totalFromRange > 0L -> totalFromRange
+                        code != 206 -> response.header("Content-Length")?.toLongOrNull() ?: -1L
+                        else -> -1L
                     }
                     val rawCt = response.header("Content-Type")?.substringBefore(';')?.trim()
 
@@ -480,6 +559,23 @@ object MediaSniffer {
                     }
 
                     val resolvedCt = magicMime ?: rawCt
+                    // If server returned 206 without total size in Content-Range, query HEAD for real total size
+                    if (contentLength <= 0L && code == 206) {
+                        val headLen = runCatching {
+                            probeClient.newCall(buildAttempt(includeOrigin, includeReferer, methodHead = true))
+                                .execute()
+                                .use { headResp ->
+                                    if (headResp.isSuccessful) {
+                                        headResp.header("Content-Length")?.toLongOrNull() ?: -1L
+                                    } else {
+                                        -1L
+                                    }
+                                }
+                        }.getOrDefault(-1L)
+                        if (headLen > 0L) {
+                            contentLength = headLen
+                        }
+                    }
                     code to MediaProbeResult(contentLength, resolvedCt)
                 }
             }.getOrElse { -1 to null }
@@ -618,12 +714,39 @@ object MediaSniffer {
                     return '';
                 }
 
+                function isSegmentOrFragmentUrl(u) {
+                    if (!u) return true;
+                    if (/\.(ts|m4s|m4f|cmfv|cmfa|cmft|fmp4|ismv|isma|mp4v|mp4a|m2ts)(\?|#|$)/i.test(u)) return true;
+                    if (/(^|[\/_.-])(init|header|map|seg|segment|chunk|frag|fragment)s?(\d+|[-_.][a-z0-9]+)*\.(mp4|m4v|webm|m4s)(\?|#|$)/i.test(u)) return true;
+                    if (!/\.(m3u8|mpd)(\?|#|$)/i.test(u) && /(\/seg(ment)?s?\/|\/chunks?\/|\/frag(ment)?s?\/|[?&](seg|segment|chunk|frag|fragment|sq|seg_no)=\d+)/i.test(u)) return true;
+                    return false;
+                }
+
+                function isTinyVideoResponse(ct, contentLengthHeader, contentRangeHeader) {
+                    if (!ct || ct.indexOf('video/') !== 0) return false;
+                    if (ct.indexOf('mp2t') >= 0 || ct.indexOf('iso.segment') >= 0) return true;
+                    var total = -1;
+                    if (contentRangeHeader) {
+                        var slashIdx = contentRangeHeader.lastIndexOf('/');
+                        if (slashIdx >= 0) {
+                            var parsedTotal = parseInt(contentRangeHeader.substring(slashIdx + 1), 10);
+                            if (!isNaN(parsedTotal) && parsedTotal > 0) total = parsedTotal;
+                        }
+                    }
+                    if (total < 0 && contentLengthHeader && !contentRangeHeader) {
+                        var parsedLen = parseInt(contentLengthHeader, 10);
+                        if (!isNaN(parsedLen) && parsedLen > 0) total = parsedLen;
+                    }
+                    return total > 0 && total < 307200;
+                }
+
                 function report(url, title, res, dur, origin, audioUrl, thumbUrl) {
                     try {
                         var clean = unescapeJsonUrl(url);
                         if (!clean || clean.indexOf('http') !== 0) return;
                         if (clean.indexOf('blob:') === 0 || clean.indexOf('data:') === 0) return;
                         if (clean.length > 2200) return;
+                        if (isSegmentOrFragmentUrl(clean)) return;
                         var cleanThumb = thumbUrl ? (thumbUrl.indexOf('data:image/') === 0 ? thumbUrl : unescapeJsonUrl(thumbUrl)) : '';
                         var key = clean + '|' + (audioUrl || '') + '|' + (cleanThumb ? '1' : '0');
                         if (window.__svReported.has(key)) return;
@@ -802,8 +925,12 @@ object MediaSniffer {
                                 try {
                                     if (!resp) return;
                                     var ct = (resp.headers && resp.headers.get('content-type')) ? resp.headers.get('content-type').toLowerCase() : '';
+                                    var cl = (resp.headers && resp.headers.get('content-length')) ? resp.headers.get('content-length') : '';
+                                    var cr = (resp.headers && resp.headers.get('content-range')) ? resp.headers.get('content-range') : '';
                                     var finalUrl = resp.url || reqUrl;
-                                    if (ct.indexOf('video/') === 0 || ct.indexOf('mpegurl') >= 0 || ct.indexOf('dash+xml') >= 0) {
+                                    if (ct.indexOf('mpegurl') >= 0 || ct.indexOf('dash+xml') >= 0) {
+                                        report(finalUrl, document.title, '', 0, 'Fetch Media');
+                                    } else if (ct.indexOf('video/') === 0 && !isTinyVideoResponse(ct, cl, cr)) {
                                         report(finalUrl, document.title, '', 0, 'Fetch Media');
                                     } else if (ct.indexOf('application/json') >= 0 || ct.indexOf('text/javascript') >= 0 || ct.indexOf('text/plain') >= 0 || ct.indexOf('application/octet-stream') >= 0) {
                                         var clone = resp.clone();
@@ -844,8 +971,12 @@ object MediaSniffer {
                             this.addEventListener('load', function() {
                                 try {
                                     var ct = (this.getResponseHeader('content-type') || '').toLowerCase();
+                                    var cl = this.getResponseHeader('content-length') || '';
+                                    var cr = this.getResponseHeader('content-range') || '';
                                     var respUrl = this.responseURL || this.__svUrl || '';
-                                    if (ct.indexOf('video/') === 0 || ct.indexOf('mpegurl') >= 0 || ct.indexOf('dash+xml') >= 0) {
+                                    if (ct.indexOf('mpegurl') >= 0 || ct.indexOf('dash+xml') >= 0) {
+                                        report(respUrl, document.title, '', 0, 'XHR Media');
+                                    } else if (ct.indexOf('video/') === 0 && !isTinyVideoResponse(ct, cl, cr)) {
                                         report(respUrl, document.title, '', 0, 'XHR Media');
                                     } else if ((!this.responseType || this.responseType === 'text') && this.responseText) {
                                         var head = this.responseText.trimStart();

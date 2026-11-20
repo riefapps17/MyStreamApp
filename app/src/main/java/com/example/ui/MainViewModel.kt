@@ -698,7 +698,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // Probe file size & content-type asynchronously
+        // Probe file size & content-type asynchronously; automatically remove tiny sub-segments (<300 KB)
         val probeKey = "$tabId|$normalizedUrl"
         if (isNewEntry && format != MediaFormat.HLS && format != MediaFormat.DASH && probedUrls.add(probeKey)) {
             viewModelScope.launch {
@@ -709,13 +709,42 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     userAgent = userAgent,
                     cookie = cookie
                 )
-                if (probe.sizeBytes > 0L || !probe.contentType.isNullOrBlank()) {
+                val probedCt = probe.contentType?.substringBefore(';')?.trim().orEmpty()
+                val isInvalidOrSegmentMime = probedCt.startsWith("text/html", ignoreCase = true) ||
+                    probedCt.contains("video/mp2t", ignoreCase = true) ||
+                    probedCt.contains("video/iso.segment", ignoreCase = true)
+                val isTinyFragment = MediaSniffer.isTinyOrFragmentSize(format, probe.sizeBytes)
+
+                if (isTinyFragment || isInvalidOrSegmentMime) {
+                    updateTab(tabId) { current ->
+                        current.copy(
+                            detectedMedia = current.detectedMedia.filterNot { it.url == normalizedUrl }
+                        )
+                    }
+                    return@launch
+                }
+
+                // If magic bytes revealed this URL is actually an HLS/DASH manifest, upgrade its format
+                val upgradedFormat = if (probedCt.isNotBlank()) {
+                    MediaSniffer.classifyUrl(normalizedUrl, probedCt) ?: format
+                } else {
+                    format
+                }
+
+                if (probe.sizeBytes > 0L || probedCt.isNotBlank()) {
                     updateTab(tabId) { current ->
                         val updated = current.detectedMedia.map { item ->
                             if (item.url == normalizedUrl) {
                                 item.copy(
-                                    sizeBytes = if (probe.sizeBytes > 0L) probe.sizeBytes else item.sizeBytes,
-                                    mimeType = probe.contentType?.substringBefore(';')?.trim() ?: item.mimeType
+                                    format = upgradedFormat,
+                                    sizeBytes = if (upgradedFormat == MediaFormat.HLS || upgradedFormat == MediaFormat.DASH) {
+                                        -1L
+                                    } else if (probe.sizeBytes > 0L) {
+                                        probe.sizeBytes
+                                    } else {
+                                        item.sizeBytes
+                                    },
+                                    mimeType = probedCt.ifBlank { item.mimeType }
                                 )
                             } else {
                                 item
@@ -739,6 +768,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // Strictly probe & detect videos ONLY on the currently active tab
         if (tabId != _activeTabId.value) return
         val normalizedUrl = MediaSniffer.normalizeVideoUrl(url)
+        if (MediaSniffer.isLikelyMediaSegmentOrFragment(normalizedUrl)) return
         val probeKey = "$tabId|$normalizedUrl"
         if (!probeCandidateUrls.add(probeKey)) return
         val alreadyDetected = _tabs.value
@@ -759,7 +789,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             // Re-verify active tab after async network probe completes
             if (tabId != _activeTabId.value) return@launch
             val ct = probe.contentType
-            if (!ct.isNullOrBlank() && MediaSniffer.classifyUrl(normalizedUrl, ct) != null) {
+            val detectedFormat = if (!ct.isNullOrBlank()) {
+                MediaSniffer.classifyUrl(normalizedUrl, ct)
+            } else {
+                null
+            }
+            if (detectedFormat != null) {
+                // Skip tiny few-KB initialization headers or micro-chunks of the main video
+                if (MediaSniffer.isTinyOrFragmentSize(detectedFormat, probe.sizeBytes)) {
+                    return@launch
+                }
                 probedUrls.add(probeKey)
                 onMediaSniffed(
                     tabId = tabId,
@@ -775,7 +814,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     origin = "CDN Probe",
                     audioUrl = ""
                 )
-                if (probe.sizeBytes > 0L) {
+                if (probe.sizeBytes > 0L &&
+                    detectedFormat != MediaFormat.HLS &&
+                    detectedFormat != MediaFormat.DASH
+                ) {
                     updateTab(tabId) { current ->
                         current.copy(
                             detectedMedia = current.detectedMedia.map { item ->

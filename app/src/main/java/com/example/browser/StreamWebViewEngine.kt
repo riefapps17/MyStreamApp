@@ -28,7 +28,8 @@ class StreamSnifferBridge(
         thumbnailUrl: String
     ) -> Unit,
     private val onPagePosterDetected: (posterUrl: String) -> Unit,
-    private val onCosmeticAdBlocked: (count: Int) -> Unit
+    private val onCosmeticAdBlocked: (count: Int) -> Unit,
+    private val onJsPopupBlocked: (url: String) -> Unit = {}
 ) {
     @JavascriptInterface
     fun onMediaFound(
@@ -55,6 +56,11 @@ class StreamSnifferBridge(
         if (count > 0) {
             onCosmeticAdBlocked(count)
         }
+    }
+
+    @JavascriptInterface
+    fun onPopupBlockedInJs(url: String) {
+        onJsPopupBlocked(url)
     }
 }
 
@@ -171,6 +177,12 @@ fun createConfiguredWebView(
                 },
                 onCosmeticAdBlocked = { count ->
                     callbacks.onAdBlocked(tabId, currentPageUrlRef.get().orEmpty(), count)
+                },
+                onJsPopupBlocked = { blockedUrl ->
+                    callbacks.onPopupBlocked(
+                        tabId,
+                        blockedUrl.ifBlank { currentPageUrlRef.get().orEmpty() }
+                    )
                 }
             ),
             "StreamVaultBridge"
@@ -186,6 +198,12 @@ fun createConfiguredWebView(
                 currentPageHostRef.set(runCatching { Uri.parse(url).host.orEmpty() }.getOrDefault(""))
                 callbacks.onPageStarted(tabId, url)
                 callbacks.onNavigationStateChanged(tabId, hasValidBackHistory(view), view.canGoForward())
+                if (isAdBlockEnabled() || isPopupBlockEnabled()) {
+                    view.evaluateJavascript(
+                        AdBlockEngine.buildCosmeticScript(blockPopups = isPopupBlockEnabled()),
+                        null
+                    )
+                }
             }
 
             override fun onPageFinished(view: WebView, url: String?) {
@@ -200,7 +218,7 @@ fun createConfiguredWebView(
                 if (isTabActive()) {
                     view.evaluateJavascript(MediaSniffer.MEDIA_SNIFFER_JS, null)
                 }
-                if (isAdBlockEnabled()) {
+                if (isAdBlockEnabled() || isPopupBlockEnabled()) {
                     view.evaluateJavascript(
                         AdBlockEngine.buildCosmeticScript(blockPopups = isPopupBlockEnabled()),
                         null
@@ -244,13 +262,13 @@ fun createConfiguredWebView(
             ): WebResourceResponse? {
                 val reqUrl = request.url?.toString().orEmpty()
 
-                // 1. Run AdBlockEngine filter on sub-resources when enabled
+                // 1. Run AdBlockEngine filter on sub-resources when enabled (returns harmless JS stub for .js bait scripts)
                 if (isAdBlockEnabled() &&
                     !request.isForMainFrame &&
                     AdBlockEngine.shouldBlockRequest(reqUrl, currentPageHostRef.get().orEmpty())
                 ) {
                     callbacks.onAdBlocked(tabId, reqUrl, 1)
-                    return AdBlockEngine.createEmptyResponse()
+                    return AdBlockEngine.createBlockedResponse(reqUrl)
                 }
 
                 // 2. Run MediaSniffer ONLY when this tab is currently active
@@ -310,6 +328,12 @@ fun createConfiguredWebView(
         webChromeClient = object : WebChromeClient() {
             override fun onProgressChanged(view: WebView, newProgress: Int) {
                 callbacks.onProgressChanged(tabId, newProgress)
+                if (newProgress in 25..75 && (isAdBlockEnabled() || isPopupBlockEnabled())) {
+                    view.evaluateJavascript(
+                        AdBlockEngine.buildCosmeticScript(blockPopups = isPopupBlockEnabled()),
+                        null
+                    )
+                }
             }
 
             override fun onReceivedTitle(view: WebView, title: String?) {
@@ -324,17 +348,18 @@ fun createConfiguredWebView(
                 isUserGesture: Boolean,
                 resultMsg: Message?
             ): Boolean {
+                val currentPageUrl = currentPageUrlRef.get().orEmpty()
                 // Block unsolicited popup windows when popup blocker is active
                 if (isPopupBlockEnabled() && !isUserGesture) {
-                    callbacks.onPopupBlocked(tabId, currentPageUrlRef.get().orEmpty())
+                    callbacks.onPopupBlocked(tabId, currentPageUrl)
                     return false
                 }
 
                 val hitUrl = view?.hitTestResult?.extra.orEmpty()
                 if (hitUrl.isNotBlank()) {
-                    if (AdBlockEngine.shouldBlockNavigation(
-                            targetUrl = hitUrl,
-                            currentPageUrl = currentPageUrlRef.get().orEmpty(),
+                    if (AdBlockEngine.shouldBlockPopupWindow(
+                            popupUrl = hitUrl,
+                            currentPageUrl = currentPageUrl,
                             isAdBlockEnabled = isAdBlockEnabled(),
                             isPopupBlockEnabled = isPopupBlockEnabled()
                         )
@@ -342,15 +367,47 @@ fun createConfiguredWebView(
                         callbacks.onPopupBlocked(tabId, hitUrl)
                         return false
                     }
-                    // Open legitimate target="_blank" link in the same WebView instead of spawning a popup
+                    // Open legitimate same-site target="_blank" link in the current WebView instead of spawning a popup
                     view?.loadUrl(hitUrl)
                     return false
                 }
 
                 if (isPopupBlockEnabled()) {
-                    callbacks.onPopupBlocked(tabId, currentPageUrlRef.get().orEmpty())
+                    callbacks.onPopupBlocked(tabId, currentPageUrl)
                 }
                 return false
+            }
+
+            override fun onJsBeforeUnload(
+                view: WebView?,
+                url: String?,
+                message: String?,
+                result: android.webkit.JsResult?
+            ): Boolean {
+                if (isPopupBlockEnabled()) {
+                    result?.confirm()
+                    return true
+                }
+                return super.onJsBeforeUnload(view, url, message, result)
+            }
+
+            override fun onJsAlert(
+                view: WebView?,
+                url: String?,
+                message: String?,
+                result: android.webkit.JsResult?
+            ): Boolean {
+                val host = runCatching { Uri.parse(url.orEmpty()).host.orEmpty() }.getOrDefault("")
+                val msgLower = message.orEmpty().lowercase()
+                if (isPopupBlockEnabled() &&
+                    (AdBlockEngine.isAdHost(host) ||
+                        (msgLower.contains("adblock") && (msgLower.contains("disable") || msgLower.contains("matikan"))))
+                ) {
+                    result?.cancel()
+                    callbacks.onPopupBlocked(tabId, url.orEmpty())
+                    return true
+                }
+                return super.onJsAlert(view, url, message, result)
             }
 
             override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {

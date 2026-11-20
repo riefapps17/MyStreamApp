@@ -90,6 +90,13 @@ fun DetectedMediaSheet(
     var showManualInput by remember { mutableStateOf(false) }
     var manualUrl by remember { mutableStateOf("") }
 
+    val playableMedia = remember(detectedMedia) {
+        detectedMedia.filterNot { item ->
+            MediaSniffer.isTinyOrFragmentSize(item.format, item.sizeBytes) ||
+                MediaSniffer.isLikelyMediaSegmentOrFragment(item.url, item.mimeType)
+        }
+    }
+
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
@@ -127,7 +134,7 @@ fun DetectedMediaSheet(
                         style = MaterialTheme.typography.titleLarge
                     )
                     Text(
-                        text = "${detectedMedia.size} aliran video tertangkap • Ketuk pratinjau untuk cek",
+                        text = "${playableMedia.size} aliran video utama • Ketuk pratinjau untuk cek",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -146,7 +153,7 @@ fun DetectedMediaSheet(
 
             Spacer(modifier = Modifier.height(14.dp))
 
-            if (detectedMedia.isEmpty()) {
+            if (playableMedia.isEmpty()) {
                 Surface(
                     color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
                     shape = RoundedCornerShape(16.dp),
@@ -183,7 +190,7 @@ fun DetectedMediaSheet(
                         .fillMaxWidth()
                         .heightIn(min = 148.dp, max = 460.dp)
                 ) {
-                    items(detectedMedia, key = { it.id }) { media ->
+                    items(playableMedia, key = { it.id }) { media ->
                         val matchingDownload = downloads.firstOrNull { it.sourceUrl == media.url }
                         DetectedMediaCard(
                             media = media,

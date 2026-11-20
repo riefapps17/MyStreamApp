@@ -9,7 +9,8 @@ object AdBlockEngine {
 
     /**
      * Curated host blocklist covering major web ad networks, video VAST/pre-roll ad servers,
-     * popunder/redirect networks, and invasive trackers. Subdomains are matched automatically.
+     * popunder/redirect networks, anti-adblock scripts, and invasive trackers.
+     * Subdomains are matched automatically.
      */
     private val blockedHosts: Set<String> = hashSetOf(
         // Google & major programmatic display/video ad networks
@@ -55,7 +56,7 @@ object AdBlockEngine {
         "connatix.com",
         "jwpltx.com",
 
-        // Streaming site popunder, push-ad & redirect networks
+        // Streaming site popunder, push-ad, overlay & redirect networks
         "popads.net",
         "popcash.net",
         "propellerads.com",
@@ -92,13 +93,35 @@ object AdBlockEngine {
         "gumgum.com",
         "kargo.com",
         "vidoomy.com",
+        "bidgear.com",
+        "pubfuture.com",
+        "adskeeper.com",
+        "adskeeper.co.uk",
+        "evadav.com",
+        "richads.com",
+        "rollerads.com",
+        "zeropark.com",
+        "trafficstars.com",
+        "plugrush.com",
+        "adtng.com",
+        "tsyndicate.com",
+        "twinrdsyn.com",
+        "acint.net",
+        "adspyglass.com",
+
+        // Anti-AdBlock script providers
+        "blockadblock.com",
+        "fuckadblock.com",
+        "getadmiral.com",
+        "admiral.com",
+        "pagefair.com",
+        "pagefair.net",
 
         // Mobile & cross-site trackers / telemetry
         "scorecardresearch.com",
         "quantserve.com",
         "hotjar.com",
         "clarity.ms",
-        "taboola.com",
         "omtrdc.net",
         "demdex.net",
         "krxd.net",
@@ -148,7 +171,7 @@ object AdBlockEngine {
     )
 
     /**
-     * URL path/query regex patterns for ad scripts, VAST tags, and popunder loaders.
+     * URL path/query regex patterns for ad scripts, VAST tags, anti-adblock detectors, and popunder loaders.
      */
     private val blockedUrlPatterns: List<Regex> = listOf(
         Regex("""/pagead/""", RegexOption.IGNORE_CASE),
@@ -157,11 +180,17 @@ object AdBlockEngine {
         Regex("""/ads/(banner|js|iframe|pop|vast|vmap)""", RegexOption.IGNORE_CASE),
         Regex("""/(popunder|popads|popup_ad|interstitial_ad)""", RegexOption.IGNORE_CASE),
         Regex("""/(adsbygoogle|prebid|gpt|pubads_impl|ad_status|adframe|ads\.min)\.js""", RegexOption.IGNORE_CASE),
+        Regex("""/(blockadblock|fuckadblock|adblock[-_]?detector|anti[-_]?adblock|detect[-_]?adblock).*\.js""", RegexOption.IGNORE_CASE),
         Regex("""(vast|vmap)\.xml(\?|$)""", RegexOption.IGNORE_CASE),
         Regex("""[?&](ad_tag|ad_unit|vast_url|popunder)=[^&]+""", RegexOption.IGNORE_CASE)
     )
 
     private val blockedSchemes = setOf("intent", "market", "itms-apps", "tel", "sms")
+
+    private const val FAKE_AD_JS_STUB =
+        "window.canRunAds=true;window.isAdBlockActive=false;window.adBlockEnabled=false;" +
+            "window.adsbygoogle=window.adsbygoogle||[];window.adsbygoogle.loaded=true;" +
+            "window.google_ad_modifications=window.google_ad_modifications||{};"
 
     /**
      * Checks whether a host or any of its parent domains is in [blockedHosts]
@@ -213,7 +242,7 @@ object AdBlockEngine {
             return false
         }
 
-        // 3. Check ad script / VAST / popunder URL path patterns
+        // 3. Check ad script / VAST / popunder / anti-adblock URL path patterns
         val pathAndQuery = buildString {
             append(uri.encodedPath.orEmpty())
             val q = uri.encodedQuery
@@ -283,6 +312,57 @@ object AdBlockEngine {
     }
 
     /**
+     * Checks whether a newly spawned popup window URL should be blocked when Popup Blocker is active.
+     * In addition to ad hosts and ad URL patterns, blocks unsolicited cross-domain popup windows.
+     */
+    fun shouldBlockPopupWindow(
+        popupUrl: String,
+        currentPageUrl: String,
+        isAdBlockEnabled: Boolean,
+        isPopupBlockEnabled: Boolean
+    ): Boolean {
+        if (!isPopupBlockEnabled) return false
+        if (popupUrl.isBlank() || popupUrl.equals("about:blank", ignoreCase = true)) {
+            return true
+        }
+        if (shouldBlockNavigation(popupUrl, currentPageUrl, isAdBlockEnabled, isPopupBlockEnabled)) {
+            return true
+        }
+        val currentHost = runCatching { Uri.parse(currentPageUrl).host?.lowercase(Locale.US) }
+            .getOrNull()
+            .orEmpty()
+        val targetHost = runCatching { Uri.parse(popupUrl).host?.lowercase(Locale.US) }
+            .getOrNull()
+            .orEmpty()
+        if (currentHost.isNotEmpty() && targetHost.isNotEmpty()) {
+            val sameSite = targetHost == currentHost ||
+                targetHost.endsWith(".$currentHost") ||
+                currentHost.endsWith(".$targetHost")
+            if (!sameSite) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * Creates a response for blocked sub-resources.
+     * For blocked .js scripts, returns a harmless JS stub that sets `window.canRunAds = true`
+     * so anti-adblock detectors do not trigger `script.onerror` or missing-variable popups.
+     */
+    fun createBlockedResponse(url: String = ""): WebResourceResponse {
+        val lower = url.lowercase(Locale.US).substringBefore('?').substringBefore('#')
+        if (lower.endsWith(".js")) {
+            return WebResourceResponse(
+                "application/javascript",
+                "utf-8",
+                ByteArrayInputStream(FAKE_AD_JS_STUB.toByteArray(Charsets.UTF_8))
+            )
+        }
+        return createEmptyResponse()
+    }
+
+    /**
      * Creates a lightweight empty 200 response to short-circuit blocked ad requests cleanly.
      */
     fun createEmptyResponse(): WebResourceResponse {
@@ -294,13 +374,36 @@ object AdBlockEngine {
     }
 
     /**
-     * Builds cosmetic CSS + anti-popup JavaScript injected into pages when AdBlock is active.
+     * Builds cosmetic CSS + 4-layer anti-popup & anti-adblock JavaScript injected into WebView pages.
+     * Operates strictly inside WebView DOM and never touches native Android Compose ModalBottomSheets.
      */
     fun buildCosmeticScript(blockPopups: Boolean): String {
         val popupFlag = if (blockPopups) "true" else "false"
         return """
             (function() {
                 try {
+                    // --- LAYER 1: Anti-AdBlock Defuser (Bait Variables & Stubs) ---
+                    window.canRunAds = true;
+                    window.isAdBlockActive = false;
+                    window.adBlockEnabled = false;
+                    window.adblock = false;
+                    window.adblocker = false;
+                    window.google_ad_modifications = window.google_ad_modifications || {};
+                    if (!window.adsbygoogle || !window.adsbygoogle.loaded) {
+                        window.adsbygoogle = window.adsbygoogle || [];
+                        window.adsbygoogle.loaded = true;
+                        window.adsbygoogle.push = function() { return 0; };
+                    }
+                    if (!document.getElementById('arf-ad-bait')) {
+                        var bait = document.createElement('div');
+                        bait.id = 'arf-ad-bait';
+                        bait.className = 'adsbox ad-banner ad-placement pub_300x250 pub_300x250m text-ad textAd';
+                        bait.style.cssText = 'position:absolute !important;left:-9999px !important;top:-9999px !important;width:300px !important;height:250px !important;display:block !important;visibility:visible !important;pointer-events:none !important;';
+                        bait.innerHTML = '&nbsp;';
+                        (document.body || document.documentElement).appendChild(bait);
+                    }
+
+                    // --- Cosmetic CSS Filter ---
                     if (!document.getElementById('streamvault-adblock-css')) {
                         var style = document.createElement('style');
                         style.id = 'streamvault-adblock-css';
@@ -310,12 +413,18 @@ object AdBlockEngine {
                             'ins.adsbygoogle',
                             '[id^="div-gpt-ad"]',
                             '[id^="google_ads_iframe"]',
-                            '[class*="ad-banner"]',
+                            '[class*="ad-banner"]:not(#arf-ad-bait)',
                             '[class*="ad_banner"]',
                             '[class*="ads-container"]',
                             '[class*="ad-wrapper"]',
                             '[class*="sponsored-ad"]',
                             '[class*="popunder"]',
+                            '[id*="adblock-modal" i]',
+                            '[class*="adblock-modal" i]',
+                            '[id*="anti-adblock" i]',
+                            '[class*="anti-adblock" i]',
+                            '[id*="adb-detected" i]',
+                            '[class*="adb-detected" i]',
                             '[data-ad-slot]',
                             '[data-ad-client]',
                             'iframe[src*="doubleclick.net"]',
@@ -323,8 +432,10 @@ object AdBlockEngine {
                             'iframe[src*="exoclick.com"]',
                             'iframe[src*="popads.net"]',
                             'iframe[src*="adsterra.com"]',
+                            'iframe[src*="propellerads.com"]',
                             'a[href*="popads.net"]',
                             'a[href*="propellerads.com"]',
+                            'a[href*="adsterra.com"]',
                             '#demo-ad-banner'
                         ].join(',') + ' { display: none !important; visibility: hidden !important; height: 0 !important; min-height: 0 !important; pointer-events: none !important; }';
                         (document.head || document.documentElement).appendChild(style);
@@ -338,28 +449,176 @@ object AdBlockEngine {
                         } catch (e) {}
                     }
 
-                    // Count & neutralize hidden ad elements on initial pass
+                    function reportPopupBlocked(url) {
+                        try {
+                            if (window.StreamVaultBridge && window.StreamVaultBridge.onPopupBlockedInJs) {
+                                window.StreamVaultBridge.onPopupBlockedInJs(String(url || window.location.href));
+                            } else {
+                                reportBlocked(1);
+                            }
+                        } catch (e) {}
+                    }
+
+                    function isSameOrSubdomain(targetHost, currentHost) {
+                        if (!targetHost || !currentHost) return true;
+                        var t = targetHost.toLowerCase();
+                        var c = currentHost.toLowerCase();
+                        return t === c || t.endsWith('.' + c) || c.endsWith('.' + t);
+                    }
+
+                    function containsMediaPlayer(el) {
+                        if (!el || !el.querySelector) return false;
+                        if (el.tagName === 'VIDEO' || el.tagName === 'AUDIO') return true;
+                        if (el.querySelector('video, audio, .jwplayer, .video-js, .plyr, [class*="jw-"], [class*="vjs-"]')) return true;
+                        return false;
+                    }
+
+                    // --- LAYER 2: Anti-AdBlock Modal & Transparent Click-Hijack Overlay Sweeper ---
+                    function sweepInPagePopupsAndOverlays() {
+                        try {
+                            var removedCount = 0;
+                            var vw = Math.max(window.innerWidth || 0, 320);
+                            var vh = Math.max(window.innerHeight || 0, 480);
+
+                            // 2A. Dismiss anti-adblock warning modals & transparent click-hijack overlays
+                            var candidates = document.querySelectorAll('div, section, aside, dialog, iframe, a');
+                            for (var i = 0; i < candidates.length && i < 240; i++) {
+                                var el = candidates[i];
+                                if (!el || el.id === 'arf-ad-bait' || el.getAttribute('data-arf-cleaned') === '1') continue;
+                                if (containsMediaPlayer(el)) continue;
+
+                                var cs = window.getComputedStyle ? window.getComputedStyle(el) : null;
+                                if (!cs || cs.display === 'none' || cs.visibility === 'hidden') continue;
+
+                                var pos = cs.position;
+                                var zIndex = parseInt(cs.zIndex, 10);
+                                if (isNaN(zIndex)) zIndex = 0;
+
+                                // Detect Anti-AdBlock modal dialogs ("Disable Adblock" / "Matikan Adblock")
+                                if ((pos === 'fixed' || pos === 'absolute' || el.tagName === 'DIALOG') && zIndex >= 50) {
+                                    var idCls = ((el.id || '') + ' ' + (typeof el.className === 'string' ? el.className : '')).toLowerCase();
+                                    var txt = (el.innerText || el.textContent || '').toLowerCase();
+                                    var looksLikeAntiAdblockModal =
+                                        /anti[-_]?adblock|adblock[-_]?modal|adb[-_]?modal|blockadblock|fuckadblock/i.test(idCls) ||
+                                        (txt.length > 15 && txt.length < 1200 &&
+                                            /(adblock|ad blocker|pemblokir iklan)/i.test(txt) &&
+                                            /(disable|turn off|matikan|nonaktifkan|detected|terdeteksi|whitelist)/i.test(txt));
+                                    if (looksLikeAntiAdblockModal) {
+                                        el.setAttribute('data-arf-cleaned', '1');
+                                        el.style.setProperty('display', 'none', 'important');
+                                        el.style.setProperty('pointer-events', 'none', 'important');
+                                        if (document.body) document.body.style.setProperty('overflow', 'auto', 'important');
+                                        if (document.documentElement) document.documentElement.style.setProperty('overflow', 'auto', 'important');
+                                        removedCount++;
+                                        continue;
+                                    }
+                                }
+
+                                // Detect transparent full-screen / player-covering click-hijack overlays
+                                if ($popupFlag && (pos === 'fixed' || pos === 'absolute') && zIndex >= 900) {
+                                    var rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+                                    if (!rect) continue;
+                                    var coversScreen = rect.width >= vw * 0.65 && rect.height >= vh * 0.45;
+                                    if (!coversScreen) continue;
+
+                                    var opacity = parseFloat(cs.opacity || '1');
+                                    var bg = (cs.backgroundColor || '').replace(/\s+/g, '');
+                                    var isTransparent = opacity <= 0.08 || bg === 'transparent' || bg === 'rgba(0,0,0,0)';
+                                    var hasNoVisibleText = (el.innerText || '').trim().length === 0;
+                                    var hasNoControls = !el.querySelector('input, button, select, textarea, form, nav');
+
+                                    if (isTransparent && hasNoVisibleText && hasNoControls) {
+                                        el.setAttribute('data-arf-cleaned', '1');
+                                        el.style.setProperty('display', 'none', 'important');
+                                        el.style.setProperty('pointer-events', 'none', 'important');
+                                        removedCount++;
+                                    }
+                                }
+                            }
+
+                            if (removedCount > 0) {
+                                reportBlocked(removedCount);
+                            }
+                        } catch (e) {}
+                    }
+
+                    // Initial cleanup pass
                     if (!window.__streamVaultAdCleanupDone) {
                         window.__streamVaultAdCleanupDone = true;
-                        var adNodes = document.querySelectorAll('.adsbygoogle, [id^="div-gpt-ad"], [class*="ad-banner"], #demo-ad-banner');
+                        var adNodes = document.querySelectorAll('.adsbygoogle, [id^="div-gpt-ad"], [class*="ad-banner"]:not(#arf-ad-bait), #demo-ad-banner');
                         if (adNodes.length > 0) {
                             reportBlocked(adNodes.length);
                         }
                     }
+                    sweepInPagePopupsAndOverlays();
 
-                    // Neutralize rogue window.open popups and transparent click-hijack overlays
+                    // --- LAYER 3: Strict window.open & Dynamic <a target="_blank"> Click-Hijack Guard ---
                     if ($popupFlag && !window.__streamVaultPopupGuard) {
                         window.__streamVaultPopupGuard = true;
+
                         var origOpen = window.open;
                         window.open = function(url) {
                             try {
-                                if (!url || /pop|ad|click|track|promo|bet|casino/i.test(String(url))) {
-                                    reportBlocked(1);
+                                var raw = String(url || '').trim();
+                                if (!raw || raw === 'about:blank' || /pop|ad|click|track|promo|bet|casino|offer|redirect|exoclick|adsterra|propeller/i.test(raw)) {
+                                    reportPopupBlocked(raw);
                                     return null;
                                 }
-                            } catch (e) {}
+                                var parsed = new URL(raw, window.location.href);
+                                if (!isSameOrSubdomain(parsed.hostname, window.location.hostname)) {
+                                    reportPopupBlocked(parsed.href);
+                                    return null;
+                                }
+                            } catch (e) {
+                                reportPopupBlocked(url);
+                                return null;
+                            }
                             return origOpen ? origOpen.apply(this, arguments) : null;
                         };
+
+                        // Intercept invisible / hijacked <a target="_blank"> clicks injected over video players
+                        document.addEventListener('click', function(e) {
+                            try {
+                                var target = e.target;
+                                while (target && target !== document && target.tagName !== 'A') {
+                                    target = target.parentElement;
+                                }
+                                if (!target || target.tagName !== 'A') return;
+                                var href = target.getAttribute('href') || target.href || '';
+                                var opensNewWindow = (target.getAttribute('target') || '').toLowerCase() === '_blank';
+                                if (!href) return;
+
+                                var isAdOrPopPattern = /popads|propeller|adsterra|exoclick|clickadu|hilltopads|adcash|onclickads|monetag|popunder|redirect|bet|casino/i.test(href);
+                                var cs = window.getComputedStyle ? window.getComputedStyle(target) : null;
+                                var isInvisibleOverlayLink = cs && (cs.position === 'fixed' || cs.position === 'absolute') &&
+                                    (parseFloat(cs.opacity || '1') <= 0.1 || ((target.innerText || '').trim().length === 0 && !target.querySelector('img, svg')));
+
+                                if (isAdOrPopPattern || (opensNewWindow && isInvisibleOverlayLink)) {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+                                    target.style.setProperty('display', 'none', 'important');
+                                    target.style.setProperty('pointer-events', 'none', 'important');
+                                    reportPopupBlocked(href);
+                                }
+                            } catch (err) {}
+                        }, true);
+
+                        // Observe dynamic DOM mutations so delayed anti-adblock modals & click overlays are neutralized
+                        if (window.MutationObserver && !window.__arfPopupObserver) {
+                            var sweepTimer = null;
+                            window.__arfPopupObserver = new MutationObserver(function() {
+                                if (sweepTimer) return;
+                                sweepTimer = setTimeout(function() {
+                                    sweepTimer = null;
+                                    sweepInPagePopupsAndOverlays();
+                                }, 350);
+                            });
+                            window.__arfPopupObserver.observe(document.documentElement || document.body, {
+                                childList: true,
+                                subtree: true
+                            });
+                        }
                     }
                 } catch (e) {}
             })();

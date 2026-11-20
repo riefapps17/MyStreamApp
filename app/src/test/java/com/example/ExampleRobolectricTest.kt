@@ -151,12 +151,30 @@ class ExampleRobolectricTest {
 
     @Test
     fun `normalizeVideoUrl strips byte range params and preserves tokens`() {
-        val raw = "https://scontent.fbcdn.net/v/t42.1790-2/clip?efg=abc&bytestart=0&byteend=524287&oh=token99"
+        val raw = "https://scontent.fbcdn.net/v/t42.1790-2/clip?efg=abc&bytestart=0&byteend=524287&range=0-65535&oh=token99"
         val normalized = MediaSniffer.normalizeVideoUrl(raw)
         assertFalse(normalized.contains("bytestart="))
         assertFalse(normalized.contains("byteend="))
+        assertFalse(normalized.contains("range="))
         assertTrue(normalized.contains("efg=abc"))
         assertTrue(normalized.contains("oh=token99"))
+    }
+
+    @Test
+    fun `classifyUrl and isTinyOrFragmentSize reject tiny fMP4 init and numbered segment chunks`() {
+        // fMP4 / DASH initialization headers & numbered segment chunks must be ignored
+        assertNull(MediaSniffer.classifyUrl("https://cdn.example.com/hls/init.mp4"))
+        assertNull(MediaSniffer.classifyUrl("https://cdn.example.com/dash/init-stream0.mp4"))
+        assertNull(MediaSniffer.classifyUrl("https://cdn.example.com/video/seg-1-v1-a1.mp4"))
+        assertNull(MediaSniffer.classifyUrl("https://cdn.example.com/video/chunk_00012.mp4"))
+        assertNull(MediaSniffer.classifyUrl("https://cdn.example.com/video/frag-3.m4f"))
+        assertNull(MediaSniffer.classifyUrl("https://cdn.example.com/stream/track.mp4?sq=14"))
+
+        // Direct videos under 300 KB are flagged as tiny fragments, while HLS/DASH playlists are never flagged
+        assertTrue(MediaSniffer.isTinyOrFragmentSize(MediaFormat.MP4, 18 * 1024L))
+        assertFalse(MediaSniffer.isTinyOrFragmentSize(MediaFormat.MP4, 2 * 1024 * 1024L))
+        assertFalse(MediaSniffer.isTinyOrFragmentSize(MediaFormat.HLS, 4 * 1024L))
+        assertFalse(MediaSniffer.isTinyOrFragmentSize(MediaFormat.DASH, 8 * 1024L))
     }
 
     @Test
@@ -166,6 +184,15 @@ class ExampleRobolectricTest {
                 url = "https://cdn.example.org/stream/8912345",
                 acceptHeader = "*/*",
                 rangeHeader = "bytes=0-65535",
+                secFetchDest = null
+            )
+        )
+        // Mid-stream byte-range chunk fetch (not starting at byte 0) should not be probed as a separate video
+        assertFalse(
+            MediaSniffer.isProbeCandidate(
+                url = "https://cdn.example.org/stream/8912345",
+                acceptHeader = "*/*",
+                rangeHeader = "bytes=65536-131071",
                 secFetchDest = null
             )
         )
@@ -332,6 +359,31 @@ class ExampleRobolectricTest {
                 isPopupBlockEnabled = true
             )
         )
+
+        // Anti-AdBlock scripts and cross-domain popup windows
+        assertTrue(AdBlockEngine.shouldBlockRequest("https://cdn.blockadblock.com/blockadblock.js"))
+        assertTrue(AdBlockEngine.shouldBlockRequest("https://streaming.example.com/assets/anti-adblock.min.js"))
+        assertTrue(
+            AdBlockEngine.shouldBlockPopupWindow(
+                popupUrl = "https://random-promo-redirect.xyz/landing",
+                currentPageUrl = "https://archive.org/details/movies",
+                isAdBlockEnabled = true,
+                isPopupBlockEnabled = true
+            )
+        )
+        assertFalse(
+            AdBlockEngine.shouldBlockPopupWindow(
+                popupUrl = "https://ia800100.us.archive.org/details/BigBuckBunny",
+                currentPageUrl = "https://archive.org/details/movies",
+                isAdBlockEnabled = true,
+                isPopupBlockEnabled = true
+            )
+        )
+
+        val jsStubResp = AdBlockEngine.createBlockedResponse("https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js")
+        assertEquals("application/javascript", jsStubResp.mimeType)
+        val stubBody = jsStubResp.data.bufferedReader().readText()
+        assertTrue(stubBody.contains("window.canRunAds=true"))
     }
 
     @Test
