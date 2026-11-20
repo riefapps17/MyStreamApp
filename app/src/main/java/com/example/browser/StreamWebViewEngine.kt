@@ -17,111 +17,6 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import java.util.concurrent.atomic.AtomicReference
 
-object DemoStreamPage {
-    const val DEMO_URL = "streamvault://demo"
-    const val BASE_URL = "https://streamvault.local/"
-
-    val htmlContent = """
-        <!DOCTYPE html>
-        <html lang="id">
-        <head>
-            <meta charset="utf-8" />
-            <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-            <title>Studio Demo — Tanpa Tombol Unduh</title>
-            <style>
-                body {
-                    margin: 0; padding: 18px; background: #0B0F14; color: #F0F4F8;
-                    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-                }
-                .badge {
-                    display: inline-block; padding: 4px 10px; border-radius: 999px;
-                    background: rgba(0, 229, 195, 0.14); color: #00E5C3;
-                    font-size: 12px; font-weight: 600; margin-bottom: 10px;
-                }
-                h1 { font-size: 20px; margin: 0 0 8px 0; }
-                p { font-size: 13px; color: #94A3B8; line-height: 1.5; margin: 0 0 16px 0; }
-                .card {
-                    background: #131922; border: 1px solid #2A3647; border-radius: 16px;
-                    padding: 14px; margin-bottom: 18px;
-                }
-                .card-title { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
-                .card-sub { font-size: 12px; color: #94A3B8; margin-bottom: 10px; }
-                video {
-                    width: 100%; border-radius: 12px; background: #000;
-                    max-height: 220px;
-                }
-                .notice {
-                    margin-top: 8px; font-size: 11px; color: #FF7A45; font-weight: 600;
-                }
-                .ad-banner {
-                    background: linear-gradient(135deg, #4D1E0B, #2B0B00);
-                    border: 1px dashed #FF7A45;
-                    border-radius: 14px;
-                    padding: 12px;
-                    margin-bottom: 16px;
-                    font-size: 12px;
-                    color: #FFD6C4;
-                }
-            </style>
-        </head>
-        <body oncontextmenu="return false;">
-            <div class="badge">SIMULASI STREAMING TERPROTEKSI</div>
-            <h1>Pemutar Web Tanpa Tombol Download</h1>
-            <p>
-                Halaman ini meniru situs streaming yang memakai <code>controlsList="nodownload"</code>
-                dan memblokir klik kanan. Putar salah satu video di bawah — StreamVault akan
-                menangkap aliran MP4 dan HLS (.m3u8) secara otomatis di tombol melayang!
-            </p>
-
-            <div id="demo-ad-banner" class="ad-banner">
-                <strong>[Simulasi Banner Iklan]</strong> Elemen ini disembunyikan otomatis saat Perisai AdBlock aktif.
-            </div>
-
-            <div class="card">
-                <div class="card-title">1. Big Buck Bunny (Stream MP4 Langsung)</div>
-                <div class="card-sub">Blender Foundation • HTML5 Video tanpa tombol unduh</div>
-                <video
-                    controls
-                    playsinline
-                    preload="metadata"
-                    controlsList="nodownload noplaybackrate"
-                    disablePictureInPicture
-                    poster="https://peach.blender.org/wp-content/uploads/title_anouncement.jpg?x11217"
-                    src="https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4">
-                </video>
-                <div class="notice">controlsList="nodownload" aktif di halaman ini</div>
-            </div>
-
-            <div class="card">
-                <div class="card-title">2. Sintel Trailer (Adaptive HLS .m3u8)</div>
-                <div class="card-sub">Stream adaptif M3U8 • Siap diputar & digabung ke offline</div>
-                <video
-                    id="hlsDemo"
-                    controls
-                    playsinline
-                    preload="metadata"
-                    controlsList="nodownload">
-                    <source src="https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8" type="application/x-mpegURL" />
-                </video>
-                <div class="notice">Aliran HLS (.m3u8) tanpa tautan unduhan</div>
-            </div>
-
-            <div class="card">
-                <div class="card-title">3. For Bigger Blazes (Klip HD MP4)</div>
-                <div class="card-sub">Klip singkat 15 detik • Cepat untuk uji simpan</div>
-                <video
-                    controls
-                    playsinline
-                    preload="metadata"
-                    controlsList="nodownload"
-                    src="https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4">
-                </video>
-            </div>
-        </body>
-        </html>
-    """.trimIndent()
-}
-
 class StreamSnifferBridge(
     private val onMediaDetected: (
         url: String,
@@ -206,7 +101,8 @@ fun createConfiguredWebView(
     tabId: String,
     callbacks: WebViewCallbacks,
     isAdBlockEnabled: () -> Boolean,
-    isPopupBlockEnabled: () -> Boolean
+    isPopupBlockEnabled: () -> Boolean,
+    isTabActive: () -> Boolean = { true }
 ): WebView {
     // Thread-safe mirror of current page URL/host for IO-thread shouldInterceptRequest access
     val currentPageUrlRef = AtomicReference("")
@@ -243,6 +139,8 @@ fun createConfiguredWebView(
         addJavascriptInterface(
             StreamSnifferBridge(
                 onMediaDetected = { mediaUrl, title, res, dur, origin, audioUrl, thumbUrl ->
+                    // Strictly detect videos only for the currently active tab
+                    if (!isTabActive()) return@StreamSnifferBridge
                     val currentPage = currentPageUrlRef.get().orEmpty()
                     val normalizedUrl = MediaSniffer.normalizeVideoUrl(mediaUrl)
                     val normalizedAudio = if (audioUrl.isNotBlank()) MediaSniffer.normalizeVideoUrl(audioUrl) else ""
@@ -268,6 +166,7 @@ fun createConfiguredWebView(
                     )
                 },
                 onPagePosterDetected = { posterUrl ->
+                    if (!isTabActive()) return@StreamSnifferBridge
                     callbacks.onPagePosterFound(tabId, posterUrl)
                 },
                 onCosmeticAdBlocked = { count ->
@@ -283,10 +182,9 @@ fun createConfiguredWebView(
                 if (url.isNullOrBlank() || url.equals("about:blank", ignoreCase = true)) {
                     return
                 }
-                val cleanUrl = if (url == DemoStreamPage.BASE_URL) DemoStreamPage.DEMO_URL else url
-                currentPageUrlRef.set(cleanUrl)
-                currentPageHostRef.set(runCatching { Uri.parse(cleanUrl).host.orEmpty() }.getOrDefault(""))
-                callbacks.onPageStarted(tabId, cleanUrl)
+                currentPageUrlRef.set(url)
+                currentPageHostRef.set(runCatching { Uri.parse(url).host.orEmpty() }.getOrDefault(""))
+                callbacks.onPageStarted(tabId, url)
                 callbacks.onNavigationStateChanged(tabId, hasValidBackHistory(view), view.canGoForward())
             }
 
@@ -295,12 +193,13 @@ fun createConfiguredWebView(
                 if (url.isNullOrBlank() || url.equals("about:blank", ignoreCase = true)) {
                     return
                 }
-                val cleanUrl = if (url == DemoStreamPage.BASE_URL) DemoStreamPage.DEMO_URL else url
-                currentPageUrlRef.set(cleanUrl)
-                currentPageHostRef.set(runCatching { Uri.parse(cleanUrl).host.orEmpty() }.getOrDefault(""))
-                val pageTitle = view.title?.takeIf { it.isNotBlank() } ?: cleanUrl
-                callbacks.onPageFinished(tabId, cleanUrl, pageTitle, hasValidBackHistory(view), view.canGoForward())
-                view.evaluateJavascript(MediaSniffer.MEDIA_SNIFFER_JS, null)
+                currentPageUrlRef.set(url)
+                currentPageHostRef.set(runCatching { Uri.parse(url).host.orEmpty() }.getOrDefault(""))
+                val pageTitle = view.title?.takeIf { it.isNotBlank() } ?: url
+                callbacks.onPageFinished(tabId, url, pageTitle, hasValidBackHistory(view), view.canGoForward())
+                if (isTabActive()) {
+                    view.evaluateJavascript(MediaSniffer.MEDIA_SNIFFER_JS, null)
+                }
                 if (isAdBlockEnabled()) {
                     view.evaluateJavascript(
                         AdBlockEngine.buildCosmeticScript(blockPopups = isPopupBlockEnabled()),
@@ -314,10 +213,9 @@ fun createConfiguredWebView(
                 if (view == null || url.isNullOrBlank() || url.equals("about:blank", ignoreCase = true)) {
                     return
                 }
-                val cleanUrl = if (url == DemoStreamPage.BASE_URL) DemoStreamPage.DEMO_URL else url
-                currentPageUrlRef.set(cleanUrl)
-                currentPageHostRef.set(runCatching { Uri.parse(cleanUrl).host.orEmpty() }.getOrDefault(""))
-                callbacks.onUrlVisited(tabId, cleanUrl, hasValidBackHistory(view), view.canGoForward())
+                currentPageUrlRef.set(url)
+                currentPageHostRef.set(runCatching { Uri.parse(url).host.orEmpty() }.getOrDefault(""))
+                callbacks.onUrlVisited(tabId, url, hasValidBackHistory(view), view.canGoForward())
             }
 
             override fun shouldOverrideUrlLoading(
@@ -355,7 +253,11 @@ fun createConfiguredWebView(
                     return AdBlockEngine.createEmptyResponse()
                 }
 
-                // 2. Run MediaSniffer to capture playable streaming URLs (direct, HLS, DASH, extensionless CDN)
+                // 2. Run MediaSniffer ONLY when this tab is currently active
+                if (!isTabActive()) {
+                    return super.shouldInterceptRequest(view, request)
+                }
+
                 val normalizedUrl = MediaSniffer.normalizeVideoUrl(reqUrl)
                 val acceptHeader = request.requestHeaders["Accept"]
                 val rangeHeader = request.requestHeaders["Range"]
@@ -493,18 +395,6 @@ fun goBackSafely(webView: WebView): Boolean {
         }
     }
     if (targetIndex < 0) return false
-
-    val targetUrl = list.getItemAtIndex(targetIndex)?.url.orEmpty()
-    if (targetUrl == DemoStreamPage.BASE_URL) {
-        webView.loadDataWithBaseURL(
-            DemoStreamPage.BASE_URL,
-            DemoStreamPage.htmlContent,
-            "text/html",
-            "utf-8",
-            null
-        )
-        return true
-    }
 
     val steps = targetIndex - currentIndex
     if (webView.canGoBackOrForward(steps)) {

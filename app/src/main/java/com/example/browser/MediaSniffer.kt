@@ -129,7 +129,7 @@ object MediaSniffer {
 
     fun deriveOriginHeader(referer: String, fallbackUrl: String = ""): String {
         val candidate = referer.ifBlank { fallbackUrl }
-        if (candidate.isBlank() || candidate.startsWith("streamvault://")) return ""
+        if (candidate.isBlank()) return ""
         return runCatching {
             val uri = Uri.parse(candidate)
             val scheme = uri.scheme

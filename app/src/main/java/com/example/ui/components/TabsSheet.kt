@@ -18,8 +18,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Public
-import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -28,6 +29,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -45,6 +47,7 @@ fun TabsSheet(
     onDismiss: () -> Unit,
     onSelectTab: (String) -> Unit,
     onCloseTab: (String) -> Unit,
+    onCloseAllTabs: () -> Unit,
     onNewTab: () -> Unit
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -65,11 +68,17 @@ fun TabsSheet(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text = "Tab Terbuka (${tabs.size})",
-                    style = MaterialTheme.typography.titleLarge,
-                    modifier = Modifier.weight(1f)
-                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Tab Terbuka (${tabs.size})",
+                        style = MaterialTheme.typography.titleLarge
+                    )
+                    Text(
+                        text = "Deteksi video hanya aktif di tab aktif",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
                 Button(
                     onClick = onNewTab,
                     shape = RoundedCornerShape(999.dp),
@@ -85,13 +94,35 @@ fun TabsSheet(
                 }
             }
 
-            Spacer(modifier = Modifier.height(14.dp))
+            if (tabs.size > 1) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 4.dp),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    TextButton(
+                        onClick = onCloseAllTabs,
+                        modifier = Modifier.testTag("close_all_tabs_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.DeleteSweep,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Tutup Semua Tab")
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
 
             LazyColumn(
                 verticalArrangement = Arrangement.spacedBy(10.dp),
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height((tabs.size.coerceAtMost(4) * 76).dp.coerceAtLeast(80.dp))
+                    .height((tabs.size.coerceAtMost(5) * 76).dp.coerceAtLeast(80.dp))
             ) {
                 items(tabs, key = { it.id }) { tab ->
                     val isActive = tab.id == activeTabId
@@ -116,13 +147,13 @@ fun TabsSheet(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Icon(
-                                imageVector = if (tab.detectedMedia.isNotEmpty()) {
-                                    Icons.Default.Videocam
+                                imageVector = if (isActive && tab.detectedMedia.isNotEmpty()) {
+                                    Icons.Default.Radar
                                 } else {
                                     Icons.Default.Public
                                 },
                                 contentDescription = null,
-                                tint = if (tab.detectedMedia.isNotEmpty()) {
+                                tint = if (isActive) {
                                     MaterialTheme.colorScheme.primary
                                 } else {
                                     MaterialTheme.colorScheme.onSurfaceVariant
@@ -130,15 +161,34 @@ fun TabsSheet(
                             )
                             Spacer(modifier = Modifier.width(12.dp))
                             Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = tab.title.ifBlank { "Beranda" },
-                                    style = MaterialTheme.typography.titleMedium,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Text(
+                                        text = tab.title.ifBlank { "Beranda" },
+                                        style = MaterialTheme.typography.titleMedium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f, fill = false)
+                                    )
+                                    if (isActive) {
+                                        Surface(
+                                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.16f),
+                                            shape = RoundedCornerShape(6.dp)
+                                        ) {
+                                            Text(
+                                                text = "Aktif",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.primary,
+                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp)
+                                            )
+                                        }
+                                    }
+                                }
                                 Text(
                                     text = if (tab.isHomeScreen) {
-                                        "Halaman Awal StreamVault"
+                                        "Halaman Awal ArfStream"
                                     } else {
                                         tab.url
                                     },
@@ -148,7 +198,7 @@ fun TabsSheet(
                                     overflow = TextOverflow.Ellipsis
                                 )
                             }
-                            if (tab.detectedMedia.isNotEmpty()) {
+                            if (isActive && tab.detectedMedia.isNotEmpty()) {
                                 Surface(
                                     color = MaterialTheme.colorScheme.primary,
                                     shape = RoundedCornerShape(999.dp),

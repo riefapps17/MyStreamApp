@@ -61,8 +61,6 @@ fun AdBlockShieldSheet(
     val currentHost = remember(currentUrl, isHomeScreen) {
         if (isHomeScreen || currentUrl.isBlank()) {
             "Semua Situs"
-        } else if (currentUrl == "streamvault://demo") {
-            "Studio Demo"
         } else {
             runCatching { Uri.parse(currentUrl).host }.getOrNull().orEmpty().ifBlank { currentUrl }
         }

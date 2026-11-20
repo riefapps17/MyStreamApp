@@ -62,7 +62,7 @@ class StreamRepository(
     suspend fun removeBookmarkById(id: Long) = bookmarkDao.deleteById(id)
 
     suspend fun recordHistory(title: String, url: String) {
-        if (url.isBlank() || url.startsWith("about:") || url.startsWith("streamvault://")) return
+        if (url.isBlank() || url.startsWith("about:")) return
         historyDao.insert(
             HistoryEntity(
                 title = title.ifBlank { url },

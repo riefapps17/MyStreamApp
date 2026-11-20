@@ -20,6 +20,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ExitToApp
 import androidx.compose.material.icons.filled.Bookmarks
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
@@ -39,6 +40,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -74,6 +76,7 @@ fun VaultScreen(
     bookmarksCount: Int,
     onNavigateBack: () -> Unit,
     onSelectSection: (AppSection) -> Unit,
+    onExitApp: () -> Unit,
     onPlay: (DownloadEntity) -> Unit,
     onCancel: (Long) -> Unit,
     onRetry: (DownloadEntity) -> Unit,
@@ -191,6 +194,26 @@ fun VaultScreen(
                             onClick = {
                                 showNavMenu = false
                                 onSelectSection(AppSection.BOOKMARKS)
+                            }
+                        )
+                        HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    text = "Keluar",
+                                    color = MaterialTheme.colorScheme.error
+                                )
+                            },
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Filled.ExitToApp,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.error
+                                )
+                            },
+                            onClick = {
+                                showNavMenu = false
+                                onExitApp()
                             }
                         )
                     }

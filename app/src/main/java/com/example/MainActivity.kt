@@ -24,6 +24,9 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.local.DownloadStatus
@@ -81,14 +84,31 @@ private fun StreamVaultApp(
 
     val context = LocalContext.current
     val activity = context as? Activity
+    val lifecycleOwner = LocalLifecycleOwner.current
     val coroutineScope = rememberCoroutineScope()
 
     // Hoisted WebView registry so switching between Browser / Vault / Bookmarks preserves open pages & back history
     val webViews = remember { mutableStateMapOf<String, WebView>() }
     val defaultUserAgents = remember { mutableStateMapOf<String, String>() }
 
+    // Auto-save open tabs & last viewed scroll positions whenever app goes to background
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) {
+                val scrollPositions = webViews.mapValues { (_, wv) -> wv.scrollY }
+                viewModel.persistSessionNow(scrollPositions)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
     DisposableEffect(Unit) {
         onDispose {
+            val scrollPositions = webViews.mapValues { (_, wv) -> wv.scrollY }
+            viewModel.persistSessionNow(scrollPositions)
             webViews.values.forEach { wv ->
                 wv.stopLoading()
                 wv.destroy()
@@ -143,6 +163,7 @@ private fun StreamVaultApp(
                 when (currentSection) {
                     AppSection.BROWSER -> {
                         BrowserScreen(
+                            tabs = tabs,
                             activeTab = activeTab,
                             tabCount = tabs.size,
                             bookmarks = bookmarks,
@@ -157,6 +178,10 @@ private fun StreamVaultApp(
                             defaultUserAgents = defaultUserAgents,
                             webViewCommands = viewModel.webViewCommands,
                             onSelectSection = { viewModel.selectSection(it) },
+                            onSelectTab = { viewModel.selectTab(it) },
+                            onCloseTab = { viewModel.closeTab(it) },
+                            onNewTab = { viewModel.createNewTab() },
+                            onConsumePendingScrollY = { viewModel.consumePendingScrollY(it) },
                             onNavigate = { viewModel.navigateToInput(it) },
                             onReloadOrStop = { viewModel.reloadOrStopActiveTab() },
                             onGoBack = { viewModel.goBackActiveTab() },
@@ -167,6 +192,7 @@ private fun StreamVaultApp(
                             onOpenShieldSheet = { viewModel.openShieldSheet() },
                             onOpenSearchEngineSheet = { viewModel.openSearchEngineSheet() },
                             onOpenClearDataSheet = { viewModel.openClearDataSheet() },
+                            onExitApp = { activity?.finishAffinity() },
                             onSelectSearchEngine = { viewModel.setSearchEngine(it) },
                             onToggleDesktopMode = { viewModel.toggleDesktopMode() },
                             onToggleBookmark = { viewModel.toggleBookmarkCurrentPage() },
@@ -191,6 +217,7 @@ private fun StreamVaultApp(
                             bookmarksCount = bookmarks.size,
                             onNavigateBack = { viewModel.selectSection(AppSection.BROWSER) },
                             onSelectSection = { viewModel.selectSection(it) },
+                            onExitApp = { activity?.finishAffinity() },
                             onPlay = { viewModel.playLocalDownload(it) },
                             onCancel = { viewModel.cancelDownload(it) },
                             onRetry = { viewModel.retryDownload(it) },
@@ -207,6 +234,7 @@ private fun StreamVaultApp(
                             completedDownloadsCount = completedDownloadsCount,
                             onNavigateBack = { viewModel.selectSection(AppSection.BROWSER) },
                             onSelectSection = { viewModel.selectSection(it) },
+                            onExitApp = { activity?.finishAffinity() },
                             onOpenUrl = { viewModel.navigateToInput(it) },
                             onAddBookmark = { t, u -> viewModel.addBookmark(t, u) },
                             onDeleteBookmark = { viewModel.removeBookmark(it) },
@@ -238,6 +266,7 @@ private fun StreamVaultApp(
                 onDismiss = { viewModel.closeTabsSheet() },
                 onSelectTab = { viewModel.selectTab(it) },
                 onCloseTab = { viewModel.closeTab(it) },
+                onCloseAllTabs = { viewModel.closeAllTabs() },
                 onNewTab = { viewModel.createNewTab() }
             )
         }

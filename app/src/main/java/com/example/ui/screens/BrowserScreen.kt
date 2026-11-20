@@ -37,6 +37,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -45,6 +46,8 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.automirrored.filled.ExitToApp
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.BookmarkBorder
 import androidx.compose.material.icons.filled.Bookmarks
@@ -60,13 +63,10 @@ import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material.icons.filled.PlayCircleFilled
 import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Shield
-import androidx.compose.material.icons.filled.SmartDisplay
 import androidx.compose.material.icons.filled.TravelExplore
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -103,7 +103,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.example.R
-import com.example.browser.DemoStreamPage
 import com.example.browser.MediaSniffer
 import com.example.browser.WebViewCallbacks
 import com.example.browser.createConfiguredWebView
@@ -116,12 +115,17 @@ import com.example.ui.BrowserTabState
 import com.example.ui.WebViewCommand
 import kotlinx.coroutines.flow.SharedFlow
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 private const val DESKTOP_USER_AGENT =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
+private const val PAUSE_BACKGROUND_MEDIA_JS =
+    "(function(){try{document.querySelectorAll('video,audio').forEach(function(m){try{m.pause();}catch(e){}});}catch(e){}})();"
+
 @Composable
 fun BrowserScreen(
+    tabs: List<BrowserTabState>,
     activeTab: BrowserTabState,
     tabCount: Int,
     bookmarks: List<BookmarkEntity>,
@@ -136,6 +140,10 @@ fun BrowserScreen(
     defaultUserAgents: MutableMap<String, String>,
     webViewCommands: SharedFlow<WebViewCommand>,
     onSelectSection: (AppSection) -> Unit,
+    onSelectTab: (String) -> Unit,
+    onCloseTab: (String) -> Unit,
+    onNewTab: () -> Unit,
+    onConsumePendingScrollY: (String) -> Unit,
     onNavigate: (String) -> Unit,
     onReloadOrStop: () -> Unit,
     onGoBack: () -> Boolean,
@@ -146,6 +154,7 @@ fun BrowserScreen(
     onOpenShieldSheet: () -> Unit,
     onOpenSearchEngineSheet: () -> Unit,
     onOpenClearDataSheet: () -> Unit,
+    onExitApp: () -> Unit,
     onSelectSearchEngine: (SearchEngine) -> Unit,
     onToggleDesktopMode: () -> Unit,
     onToggleBookmark: () -> Unit,
@@ -168,9 +177,13 @@ fun BrowserScreen(
 
     val adBlockEnabledRef = remember { AtomicBoolean(isAdBlockEnabled) }
     val popupBlockEnabledRef = remember { AtomicBoolean(isPopupBlockEnabled) }
+    val activeTabIdRef = remember { AtomicReference(activeTab.id) }
+    val tabsRef = remember { AtomicReference(tabs) }
     SideEffect {
         adBlockEnabledRef.set(isAdBlockEnabled)
         popupBlockEnabledRef.set(isPopupBlockEnabled)
+        activeTabIdRef.set(activeTab.id)
+        tabsRef.set(tabs)
     }
 
     var fullscreenCustomView by remember { mutableStateOf<View?>(null) }
@@ -187,7 +200,19 @@ fun BrowserScreen(
                 title: String,
                 canBack: Boolean,
                 canForward: Boolean
-            ) = onPageFinished(tabId, url, title, canBack, canForward)
+            ) {
+                onPageFinished(tabId, url, title, canBack, canForward)
+                // Restore last viewed scroll position if this tab was restored from a previous session
+                val pendingScroll = tabsRef.get()
+                    .firstOrNull { it.id == tabId }
+                    ?.pendingRestoreScrollY ?: 0
+                if (pendingScroll > 0) {
+                    webViews[tabId]?.postDelayed({
+                        webViews[tabId]?.scrollTo(0, pendingScroll)
+                    }, 180L)
+                    onConsumePendingScrollY(tabId)
+                }
+            }
 
             override fun onProgressChanged(tabId: String, progress: Int) =
                 onProgressChanged(tabId, progress)
@@ -264,9 +289,23 @@ fun BrowserScreen(
                 tabId = tabId,
                 callbacks = callbacks,
                 isAdBlockEnabled = { adBlockEnabledRef.get() },
-                isPopupBlockEnabled = { popupBlockEnabledRef.get() }
+                isPopupBlockEnabled = { popupBlockEnabledRef.get() },
+                isTabActive = { activeTabIdRef.get() == tabId }
             ).also { wv ->
                 defaultUserAgents[tabId] = wv.settings.userAgentString
+            }
+        }
+    }
+
+    // Pause inactive background tab WebViews & media playback so video detection and playback
+    // stay strictly on the active tab while keeping background tabs intact for instant switching.
+    LaunchedEffect(activeTab.id, activeTab.isHomeScreen) {
+        webViews.forEach { (tabId, wv) ->
+            if (tabId == activeTab.id && !activeTab.isHomeScreen) {
+                wv.onResume()
+            } else {
+                runCatching { wv.evaluateJavascript(PAUSE_BACKGROUND_MEDIA_JS, null) }
+                wv.onPause()
             }
         }
     }
@@ -285,17 +324,7 @@ fun BrowserScreen(
             when (cmd) {
                 is WebViewCommand.LoadUrl -> {
                     val wv = getOrCreateWebView(cmd.tabId)
-                    if (cmd.url == DemoStreamPage.DEMO_URL) {
-                        wv.loadDataWithBaseURL(
-                            DemoStreamPage.BASE_URL,
-                            DemoStreamPage.htmlContent,
-                            "text/html",
-                            "utf-8",
-                            null
-                        )
-                    } else {
-                        wv.loadUrl(cmd.url)
-                    }
+                    wv.loadUrl(cmd.url)
                 }
                 is WebViewCommand.Reload -> webViews[cmd.tabId]?.reload()
                 is WebViewCommand.StopLoading -> webViews[cmd.tabId]?.stopLoading()
@@ -392,15 +421,11 @@ fun BrowserScreen(
                                 Icon(
                                     imageVector = when {
                                         activeTab.isHomeScreen -> Icons.Default.Search
-                                        activeTab.url == DemoStreamPage.DEMO_URL -> Icons.Default.Shield
                                         activeTab.url.startsWith("https://") -> Icons.Default.Lock
                                         else -> Icons.Default.Public
                                     },
                                     contentDescription = if (activeTab.isHomeScreen) "Pilih mesin pencari" else null,
-                                    tint = if (activeTab.isHomeScreen ||
-                                        activeTab.url.startsWith("https://") ||
-                                        activeTab.url == DemoStreamPage.DEMO_URL
-                                    ) {
+                                    tint = if (activeTab.isHomeScreen || activeTab.url.startsWith("https://")) {
                                         MaterialTheme.colorScheme.primary
                                     } else {
                                         MaterialTheme.colorScheme.onSurfaceVariant
@@ -572,6 +597,16 @@ fun BrowserScreen(
                                 onDismissRequest = { showOverflowMenu = false }
                             ) {
                                 DropdownMenuItem(
+                                    text = { Text("Tab Baru") },
+                                    leadingIcon = { Icon(Icons.Default.Add, contentDescription = null) },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        onNewTab()
+                                    },
+                                    modifier = Modifier.testTag("menu_new_tab")
+                                )
+                                HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                                DropdownMenuItem(
                                     text = {
                                         Text(
                                             text = if (activeTab.isHomeScreen) {
@@ -718,14 +753,6 @@ fun BrowserScreen(
                                     )
                                 }
                                 DropdownMenuItem(
-                                    text = { Text("Buka Halaman Demo Video") },
-                                    leadingIcon = { Icon(Icons.Default.SmartDisplay, contentDescription = null) },
-                                    onClick = {
-                                        showOverflowMenu = false
-                                        onNavigate(DemoStreamPage.DEMO_URL)
-                                    }
-                                )
-                                DropdownMenuItem(
                                     text = { Text("Privasi & Hapus Data") },
                                     leadingIcon = { Icon(Icons.Default.CleaningServices, contentDescription = null) },
                                     onClick = {
@@ -749,8 +776,40 @@ fun BrowserScreen(
                                         onToggleTheme()
                                     }
                                 )
+                                HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            text = "Keluar",
+                                            color = MaterialTheme.colorScheme.error
+                                        )
+                                    },
+                                    leadingIcon = {
+                                        Icon(
+                                            imageVector = Icons.AutoMirrored.Filled.ExitToApp,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.error
+                                        )
+                                    },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        onExitApp()
+                                    },
+                                    modifier = Modifier.testTag("menu_exit_app")
+                                )
                             }
                         }
+                    }
+
+                    // Fast 1-tap Horizontal Multi-Tab Strip when 2+ tabs are open
+                    if (tabs.size > 1) {
+                        QuickTabStrip(
+                            tabs = tabs,
+                            activeTabId = activeTab.id,
+                            onSelectTab = onSelectTab,
+                            onCloseTab = onCloseTab,
+                            onNewTab = onNewTab
+                        )
                     }
 
                     if (activeTab.isLoading) {
@@ -779,7 +838,6 @@ fun BrowserScreen(
                         totalAdsBlocked = totalAdsBlocked,
                         searchEngine = searchEngine,
                         onOpenUrl = onNavigate,
-                        onOpenDemo = { onNavigate(DemoStreamPage.DEMO_URL) },
                         onOpenShield = onOpenShieldSheet,
                         onOpenSearchEnginePicker = onOpenSearchEngineSheet,
                         onSelectSearchEngine = onSelectSearchEngine
@@ -788,22 +846,16 @@ fun BrowserScreen(
                     val activeWebView = remember(activeTab.id) {
                         getOrCreateWebView(activeTab.id)
                     }
-                    LaunchedEffect(activeTab.id, activeTab.isHomeScreen, activeTab.url) {
+                    LaunchedEffect(activeTab.id, activeTab.isHomeScreen, activeTab.url, activeTab.isDesktopMode) {
                         if (!activeTab.isHomeScreen &&
                             activeTab.url.isNotBlank() &&
                             (activeWebView.url.isNullOrBlank() || activeWebView.url == "about:blank")
                         ) {
-                            if (activeTab.url == DemoStreamPage.DEMO_URL) {
-                                activeWebView.loadDataWithBaseURL(
-                                    DemoStreamPage.BASE_URL,
-                                    DemoStreamPage.htmlContent,
-                                    "text/html",
-                                    "utf-8",
-                                    null
-                                )
-                            } else {
-                                activeWebView.loadUrl(activeTab.url)
+                            if (activeTab.isDesktopMode) {
+                                activeWebView.settings.userAgentString = DESKTOP_USER_AGENT
+                                activeWebView.settings.useWideViewPort = true
                             }
+                            activeWebView.loadUrl(activeTab.url)
                         }
                     }
                     AndroidView(
@@ -915,6 +967,131 @@ fun BrowserScreen(
 }
 
 @Composable
+private fun QuickTabStrip(
+    tabs: List<BrowserTabState>,
+    activeTabId: String,
+    onSelectTab: (String) -> Unit,
+    onCloseTab: (String) -> Unit,
+    onNewTab: () -> Unit
+) {
+    val listState = rememberLazyListState()
+    val activeIndex = tabs.indexOfFirst { it.id == activeTabId }
+    LaunchedEffect(activeIndex, tabs.size) {
+        if (activeIndex >= 0) {
+            listState.animateScrollToItem(activeIndex)
+        }
+    }
+
+    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 4.dp)
+            .testTag("quick_tab_strip"),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        LazyRow(
+            state = listState,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            contentPadding = PaddingValues(end = 6.dp),
+            modifier = Modifier.weight(1f)
+        ) {
+            items(tabs, key = { it.id }) { tab ->
+                val isActive = tab.id == activeTabId
+                val label = tab.title.ifBlank {
+                    if (tab.isHomeScreen) "Beranda" else tab.url
+                }
+                Surface(
+                    color = if (isActive) {
+                        MaterialTheme.colorScheme.primaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.surfaceContainer
+                    },
+                    shape = RoundedCornerShape(10.dp),
+                    border = if (isActive) {
+                        BorderStroke(1.dp, MaterialTheme.colorScheme.primary)
+                    } else {
+                        BorderStroke(0.5.dp, MaterialTheme.colorScheme.outlineVariant)
+                    },
+                    modifier = Modifier
+                        .height(40.dp)
+                        .widthIn(min = 92.dp, max = 176.dp)
+                        .clickable { onSelectTab(tab.id) }
+                        .testTag("quick_tab_chip_${tab.id}")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(start = 10.dp, end = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (isActive && tab.detectedMedia.isNotEmpty()) {
+                            Box(
+                                modifier = Modifier
+                                    .size(7.dp)
+                                    .clip(CircleShape)
+                                    .background(MaterialTheme.colorScheme.primary)
+                            )
+                            Spacer(modifier = Modifier.width(5.dp))
+                        }
+                        Text(
+                            text = label,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (isActive) {
+                                MaterialTheme.colorScheme.onPrimaryContainer
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false)
+                        )
+                        Box(
+                            modifier = Modifier
+                                .size(34.dp)
+                                .clip(CircleShape)
+                                .clickable { onCloseTab(tab.id) }
+                                .testTag("quick_tab_close_${tab.id}"),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Tutup tab $label",
+                                tint = if (isActive) {
+                                    MaterialTheme.colorScheme.onPrimaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                },
+                                modifier = Modifier.size(15.dp)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        IconButton(
+            onClick = onNewTab,
+            modifier = Modifier.testTag("quick_tab_new_button")
+        ) {
+            Surface(
+                color = MaterialTheme.colorScheme.surfaceContainer,
+                shape = RoundedCornerShape(10.dp),
+                border = BorderStroke(0.5.dp, MaterialTheme.colorScheme.outlineVariant),
+                modifier = Modifier.size(36.dp)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = Icons.Default.Add,
+                        contentDescription = "Buka tab baru",
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun MediaDetectedPulsePill(
     count: Int,
     onClick: () -> Unit
@@ -969,7 +1146,6 @@ private fun BrowserHomeStartPage(
     totalAdsBlocked: Long,
     searchEngine: SearchEngine,
     onOpenUrl: (String) -> Unit,
-    onOpenDemo: () -> Unit,
     onOpenShield: () -> Unit,
     onOpenSearchEnginePicker: () -> Unit,
     onSelectSearchEngine: (SearchEngine) -> Unit
@@ -987,12 +1163,12 @@ private fun BrowserHomeStartPage(
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // Hero Banner Card
+            // Clean Pro Browser Brand Header
             item {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(178.dp)
+                        .height(136.dp)
                         .clip(RoundedCornerShape(22.dp))
                 ) {
                     Image(
@@ -1088,14 +1264,9 @@ private fun BrowserHomeStartPage(
                         }
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = "StreamVault",
+                            text = "ArfStream",
                             style = MaterialTheme.typography.displaySmall,
                             color = Color.White
-                        )
-                        Text(
-                            text = "Putar & simpan aliran video dari web bebas iklan dan tanpa tombol unduh.",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = Color.White.copy(alpha = 0.82f)
                         )
                     }
                 }
@@ -1143,77 +1314,6 @@ private fun BrowserHomeStartPage(
                             }
                         }
                     }
-                }
-            }
-
-            // Interactive Demo CTA Card
-            item {
-                Surface(
-                    onClick = onOpenDemo,
-                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f),
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)),
-                    shape = RoundedCornerShape(18.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("open_demo_page_card")
-                ) {
-                    Row(
-                        modifier = Modifier.padding(16.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Surface(
-                            color = MaterialTheme.colorScheme.primary,
-                            shape = RoundedCornerShape(14.dp),
-                            modifier = Modifier.size(48.dp)
-                        ) {
-                            Box(contentAlignment = Alignment.Center) {
-                                Icon(
-                                    imageVector = Icons.Default.PlayCircleFilled,
-                                    contentDescription = null,
-                                    tint = MaterialTheme.colorScheme.onPrimary,
-                                    modifier = Modifier.size(28.dp)
-                                )
-                            }
-                        }
-                        Spacer(modifier = Modifier.width(14.dp))
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "Uji Coba: Halaman Tanpa Tombol Unduh",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
-                            Spacer(modifier = Modifier.height(2.dp))
-                            Text(
-                                text = "Buka simulasi pemutar MP4 & HLS (.m3u8) terproteksi untuk mencoba tangkapan otomatis.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                    }
-                }
-            }
-
-            // How It Works Micro Strip
-            item {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    StepMiniCard(
-                        number = "1",
-                        label = "Buka Situs",
-                        modifier = Modifier.weight(1f)
-                    )
-                    StepMiniCard(
-                        number = "2",
-                        label = "Putar Video",
-                        modifier = Modifier.weight(1f)
-                    )
-                    StepMiniCard(
-                        number = "3",
-                        label = "Simpan Offline",
-                        modifier = Modifier.weight(1f)
-                    )
                 }
             }
 
@@ -1281,45 +1381,6 @@ private fun BrowserHomeStartPage(
                     }
                 }
             }
-        }
-    }
-}
-
-@Composable
-private fun StepMiniCard(
-    number: String,
-    label: String,
-    modifier: Modifier = Modifier
-) {
-    Surface(
-        color = MaterialTheme.colorScheme.surfaceContainer,
-        shape = RoundedCornerShape(14.dp),
-        modifier = modifier
-    ) {
-        Column(
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 12.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Surface(
-                color = MaterialTheme.colorScheme.primaryContainer,
-                shape = CircleShape,
-                modifier = Modifier.size(24.dp)
-            ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Text(
-                        text = number,
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                }
-            }
-            Spacer(modifier = Modifier.height(6.dp))
-            Text(
-                text = label,
-                style = MaterialTheme.typography.labelLarge,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
         }
     }
 }

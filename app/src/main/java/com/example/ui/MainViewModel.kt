@@ -7,7 +7,6 @@ import android.webkit.URLUtil
 import android.webkit.WebStorage
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.browser.DemoStreamPage
 import com.example.browser.DetectedMedia
 import com.example.browser.MediaFormat
 import com.example.browser.MediaSniffer
@@ -15,6 +14,8 @@ import com.example.data.local.BookmarkEntity
 import com.example.data.local.DownloadEntity
 import com.example.data.local.DownloadStatus
 import com.example.data.local.HistoryEntity
+import com.example.data.local.SavedTabRecord
+import com.example.data.local.SavedTabSession
 import com.example.data.local.SearchEngine
 import com.example.data.local.StreamDatabase
 import com.example.data.local.UserPreferences
@@ -52,7 +53,9 @@ data class BrowserTabState(
     val detectedMedia: List<DetectedMedia> = emptyList(),
     val pageThumbnailUrl: String = "",
     val blockedAdsCount: Int = 0,
-    val blockedPopupsCount: Int = 0
+    val blockedPopupsCount: Int = 0,
+    val scrollY: Int = 0,
+    val pendingRestoreScrollY: Int = 0
 )
 
 sealed interface PlayerTarget {
@@ -144,9 +147,78 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val probedUrls = ConcurrentHashMap.newKeySet<String>()
     private val probeCandidateUrls = ConcurrentHashMap.newKeySet<String>()
 
+    @Volatile
+    private var sessionRestoreCompleted = false
+
+    @Volatile
+    private var hasUserMutatedTabs = false
+
     init {
         viewModelScope.launch {
             repository.seedInitialBookmarksIfEmpty()
+        }
+        viewModelScope.launch {
+            val saved = preferences.loadSavedTabSession()
+            if (saved != null && saved.tabs.isNotEmpty() && !hasUserMutatedTabs) {
+                val restoredTabs = saved.tabs.map { rec ->
+                    BrowserTabState(
+                        id = rec.id,
+                        url = rec.url,
+                        title = rec.title,
+                        isHomeScreen = rec.isHomeScreen,
+                        isDesktopMode = rec.isDesktopMode,
+                        scrollY = rec.scrollY,
+                        pendingRestoreScrollY = if (rec.isHomeScreen) 0 else rec.scrollY
+                    )
+                }
+                _tabs.value = restoredTabs
+                _activeTabId.value = saved.activeTabId
+            }
+            sessionRestoreCompleted = true
+        }
+    }
+
+    private fun buildSavedSessionSnapshot(scrollPositions: Map<String, Int> = emptyMap()): SavedTabSession {
+        val currentTabs = _tabs.value
+        val activeId = _activeTabId.value.takeIf { id -> currentTabs.any { it.id == id } }
+            ?: currentTabs.firstOrNull()?.id.orEmpty()
+        val records = currentTabs.map { tab ->
+            val liveScroll = scrollPositions[tab.id] ?: tab.scrollY
+            SavedTabRecord(
+                id = tab.id,
+                url = if (tab.isHomeScreen) "" else tab.url,
+                title = tab.title.ifBlank { if (tab.isHomeScreen) "Beranda" else tab.url },
+                isHomeScreen = tab.isHomeScreen || tab.url.isBlank(),
+                isDesktopMode = tab.isDesktopMode,
+                scrollY = if (tab.isHomeScreen) 0 else liveScroll.coerceAtLeast(0)
+            )
+        }
+        return SavedTabSession(activeTabId = activeId, tabs = records)
+    }
+
+    private fun persistTabsIfReady(scrollPositions: Map<String, Int> = emptyMap()) {
+        if (!sessionRestoreCompleted && !hasUserMutatedTabs) return
+        val snapshot = buildSavedSessionSnapshot(scrollPositions)
+        viewModelScope.launch {
+            preferences.saveTabSession(snapshot)
+        }
+    }
+
+    fun persistSessionNow(scrollPositions: Map<String, Int>) {
+        if (scrollPositions.isNotEmpty()) {
+            _tabs.update { list ->
+                list.map { tab ->
+                    val y = scrollPositions[tab.id]
+                    if (y != null && !tab.isHomeScreen) tab.copy(scrollY = y.coerceAtLeast(0)) else tab
+                }
+            }
+        }
+        persistTabsIfReady(scrollPositions)
+    }
+
+    fun consumePendingScrollY(tabId: String) {
+        updateTab(tabId) {
+            if (it.pendingRestoreScrollY > 0) it.copy(pendingRestoreScrollY = 0) else it
         }
     }
 
@@ -266,6 +338,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun createNewTab(initialUrl: String? = null) {
+        hasUserMutatedTabs = true
         val newTab = BrowserTabState()
         _tabs.update { it + newTab }
         _activeTabId.value = newTab.id
@@ -273,22 +346,34 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _currentSection.value = AppSection.BROWSER
         if (!initialUrl.isNullOrBlank()) {
             navigateToInput(initialUrl, newTab.id)
+        } else {
+            persistTabsIfReady()
         }
     }
 
     fun selectTab(tabId: String) {
+        val target = _tabs.value.firstOrNull { it.id == tabId } ?: return
+        hasUserMutatedTabs = true
+        val changed = _activeTabId.value != tabId
         _activeTabId.value = tabId
         _isTabsSheetOpen.value = false
         _currentSection.value = AppSection.BROWSER
+        persistTabsIfReady()
+        // Trigger fresh video detection strictly for the newly active tab
+        if (changed && !target.isHomeScreen) {
+            _webViewCommands.tryEmit(WebViewCommand.RescanDom(tabId))
+        }
     }
 
     fun closeTab(tabId: String) {
+        hasUserMutatedTabs = true
         val currentList = _tabs.value
         if (currentList.size <= 1) {
             // Reset single tab back to Home
             val reset = BrowserTabState(id = tabId)
             _tabs.value = listOf(reset)
             _webViewCommands.tryEmit(WebViewCommand.DestroyTab(tabId))
+            persistTabsIfReady()
             return
         }
         val index = currentList.indexOfFirst { it.id == tabId }
@@ -299,9 +384,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _activeTabId.value = filtered[nextIndex].id
         }
         _webViewCommands.tryEmit(WebViewCommand.DestroyTab(tabId))
+        persistTabsIfReady()
+    }
+
+    fun closeAllTabs() {
+        hasUserMutatedTabs = true
+        val oldIds = _tabs.value.map { it.id }
+        val freshTab = BrowserTabState()
+        _tabs.value = listOf(freshTab)
+        _activeTabId.value = freshTab.id
+        _isTabsSheetOpen.value = false
+        oldIds.forEach { oldId ->
+            _webViewCommands.tryEmit(WebViewCommand.DestroyTab(oldId))
+        }
+        persistTabsIfReady()
     }
 
     fun goHome() {
+        hasUserMutatedTabs = true
         val tabId = _activeTabId.value
         updateTab(tabId) {
             it.copy(
@@ -313,30 +413,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 detectedMedia = emptyList(),
                 pageThumbnailUrl = "",
                 blockedAdsCount = 0,
-                blockedPopupsCount = 0
+                blockedPopupsCount = 0,
+                scrollY = 0,
+                pendingRestoreScrollY = 0
             )
         }
+        persistTabsIfReady()
     }
 
     fun navigateToInput(rawInput: String, targetTabId: String = _activeTabId.value) {
         val trimmed = rawInput.trim()
         if (trimmed.isEmpty()) return
 
+        hasUserMutatedTabs = true
         _currentSection.value = AppSection.BROWSER
-
-        if (trimmed.equals(DemoStreamPage.DEMO_URL, ignoreCase = true)) {
-            updateTab(targetTabId) {
-                it.copy(
-                    isHomeScreen = false,
-                    url = DemoStreamPage.DEMO_URL,
-                    title = "Studio Demo — Tanpa Tombol Unduh",
-                    isLoading = true,
-                    detectedMedia = emptyList()
-                )
-            }
-            _webViewCommands.tryEmit(WebViewCommand.LoadUrl(targetTabId, DemoStreamPage.DEMO_URL))
-            return
-        }
 
         val resolvedUrl = resolveUserUrlOrSearch(trimmed)
         updateTab(targetTabId) {
@@ -344,10 +434,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 isHomeScreen = false,
                 url = resolvedUrl,
                 isLoading = true,
-                detectedMedia = emptyList()
+                detectedMedia = emptyList(),
+                scrollY = 0,
+                pendingRestoreScrollY = 0
             )
         }
         _webViewCommands.tryEmit(WebViewCommand.LoadUrl(targetTabId, resolvedUrl))
+        persistTabsIfReady()
     }
 
     private fun resolveUserUrlOrSearch(input: String): String {
@@ -399,6 +492,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (!tab.isHomeScreen) {
             _webViewCommands.tryEmit(WebViewCommand.Reload(tab.id))
         }
+        persistTabsIfReady()
         _snackbarMessage.tryEmit(if (next) "Mode Desktop aktif" else "Mode Mobile aktif")
     }
 
@@ -414,6 +508,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         probeCandidateUrls.removeIf { it.startsWith(prefix) }
         probedUrls.removeIf { it.startsWith(prefix) }
         updateTab(tabId) {
+            val isDifferentUrl = it.url.isNotBlank() && it.url != url
             it.copy(
                 isHomeScreen = false,
                 url = url,
@@ -422,9 +517,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 detectedMedia = emptyList(),
                 pageThumbnailUrl = "",
                 blockedAdsCount = 0,
-                blockedPopupsCount = 0
+                blockedPopupsCount = 0,
+                scrollY = if (isDifferentUrl) 0 else it.scrollY,
+                pendingRestoreScrollY = if (isDifferentUrl) 0 else it.pendingRestoreScrollY
             )
         }
+        persistTabsIfReady()
     }
 
     fun onAdBlocked(tabId: String, @Suppress("UNUSED_PARAMETER") blockedUrl: String, count: Int = 1) {
@@ -468,6 +566,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             repository.recordHistory(title, url)
         }
+        persistTabsIfReady()
     }
 
     fun onProgressChanged(tabId: String, progress: Int) {
@@ -483,6 +582,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         updateTab(tabId) {
             it.copy(title = title)
         }
+        persistTabsIfReady()
     }
 
     fun onNavigationStateChanged(tabId: String, canBack: Boolean, canForward: Boolean) {
@@ -499,10 +599,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 canGoForward = canForward
             )
         }
+        persistTabsIfReady()
     }
 
     fun onPagePosterFound(tabId: String, posterUrl: String) {
-        if (posterUrl.isBlank()) return
+        if (posterUrl.isBlank() || tabId != _activeTabId.value) return
         updateTab(tabId) { tab ->
             if (tab.pageThumbnailUrl.isBlank()) tab.copy(pageThumbnailUrl = posterUrl) else tab
         }
@@ -523,9 +624,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         audioUrl: String = "",
         thumbnailUrl: String = ""
     ) {
+        // Strictly allow video detection ONLY for the currently active tab
+        if (tabId != _activeTabId.value) return
         val normalizedUrl = MediaSniffer.normalizeVideoUrl(url)
         val format = MediaSniffer.classifyUrl(normalizedUrl, mimeHint) ?: return
-        val effectiveOrigin = originHeader.ifBlank { MediaSniffer.deriveOriginHeader(referer, normalizedUrl) }
+        val exactOrigin = originHeader.trim()
+        val isNetworkAuthoritative = origin == "Network" || origin == "CDN Probe"
         var isNewEntry = false
 
         _tabs.update { list ->
@@ -541,9 +645,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         resolution = existing.resolution.ifBlank { resolution },
                         durationSeconds = if (existing.durationSeconds > 0) existing.durationSeconds else durationSeconds,
                         title = if (rawTitle.isNotBlank()) rawTitle else existing.title,
-                        referer = existing.referer.ifBlank { referer },
-                        originHeader = existing.originHeader.ifBlank { effectiveOrigin },
-                        cookie = existing.cookie.ifBlank { cookie },
+                        referer = if (isNetworkAuthoritative && referer.isNotBlank()) {
+                            referer
+                        } else {
+                            existing.referer.ifBlank { referer }
+                        },
+                        originHeader = if (isNetworkAuthoritative && exactOrigin.isNotBlank()) {
+                            exactOrigin
+                        } else {
+                            existing.originHeader.ifBlank { exactOrigin }
+                        },
+                        userAgent = if (isNetworkAuthoritative && userAgent.isNotBlank()) {
+                            userAgent
+                        } else {
+                            existing.userAgent.ifBlank { userAgent }
+                        },
+                        cookie = if (isNetworkAuthoritative && cookie.isNotBlank()) {
+                            cookie
+                        } else {
+                            existing.cookie.ifBlank { cookie }
+                        },
                         audioUrl = existing.audioUrl.ifBlank { audioUrl },
                         thumbnailUrl = existing.thumbnailUrl.ifBlank { thumbnailUrl }
                     )
@@ -565,7 +686,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         resolution = resolution,
                         durationSeconds = durationSeconds,
                         referer = referer,
-                        originHeader = effectiveOrigin,
+                        originHeader = exactOrigin,
                         userAgent = userAgent,
                         cookie = cookie,
                         audioUrl = audioUrl,
@@ -584,7 +705,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val probe = MediaSniffer.probeMediaMetadata(
                     url = normalizedUrl,
                     referer = referer,
-                    originHeader = effectiveOrigin,
+                    originHeader = exactOrigin,
                     userAgent = userAgent,
                     cookie = cookie
                 )
@@ -615,6 +736,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         userAgent: String,
         cookie: String
     ) {
+        // Strictly probe & detect videos ONLY on the currently active tab
+        if (tabId != _activeTabId.value) return
         val normalizedUrl = MediaSniffer.normalizeVideoUrl(url)
         val probeKey = "$tabId|$normalizedUrl"
         if (!probeCandidateUrls.add(probeKey)) return
@@ -624,15 +747,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             ?.any { it.url == normalizedUrl } == true
         if (alreadyDetected) return
 
-        val effectiveOrigin = originHeader.ifBlank { MediaSniffer.deriveOriginHeader(referer, normalizedUrl) }
+        val exactOrigin = originHeader.trim()
         viewModelScope.launch {
             val probe = MediaSniffer.probeMediaMetadata(
                 url = normalizedUrl,
                 referer = referer,
-                originHeader = effectiveOrigin,
+                originHeader = exactOrigin,
                 userAgent = userAgent,
                 cookie = cookie
             )
+            // Re-verify active tab after async network probe completes
+            if (tabId != _activeTabId.value) return@launch
             val ct = probe.contentType
             if (!ct.isNullOrBlank() && MediaSniffer.classifyUrl(normalizedUrl, ct) != null) {
                 probedUrls.add(probeKey)
@@ -644,7 +769,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     resolution = "",
                     durationSeconds = 0,
                     referer = referer,
-                    originHeader = effectiveOrigin,
+                    originHeader = exactOrigin,
                     userAgent = userAgent,
                     cookie = cookie,
                     origin = "CDN Probe",

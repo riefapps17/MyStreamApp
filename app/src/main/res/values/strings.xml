@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">StreamVault</string>
+    <string name="app_name">ArfStream</string>
     <string name="nav_browser">Jelajah</string>
     <string name="nav_vault">Tersimpan</string>
     <string name="nav_bookmarks">Penanda</string>
@@ -15,9 +15,9 @@
     <string name="action_retry">Coba Lagi</string>
     <string name="action_cancel">Batal</string>
     <string name="empty_vault_title">Belum Ada Video Tersimpan</string>
-    <string name="empty_vault_subtitle">Putar video di tab Jelajah. StreamVault mendeteksi stream video secara otomatis meski situs tidak menyediakan tombol unduh.</string>
+    <string name="empty_vault_subtitle">Putar video di tab Jelajah. ArfStream mendeteksi stream video secara otomatis meski situs tidak menyediakan tombol unduh.</string>
     <string name="empty_sniffer_title">Belum Ada Stream Terdeteksi</string>
-    <string name="empty_sniffer_subtitle">Putar video pada halaman web terlebih dahulu agar StreamVault dapat menangkap URL aliran video (MP4, WebM, atau HLS).</string>
+    <string name="empty_sniffer_subtitle">Putar video pada halaman web terlebih dahulu agar ArfStream dapat menangkap URL aliran video (MP4, WebM, atau HLS).</string>
     <string name="adblock_shield_title">Perisai AdBlock</string>
     <string name="adblock_active">Perlindungan Aktif</string>
     <string name="adblock_paused">Perlindungan Dijeda</string>

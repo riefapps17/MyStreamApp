@@ -23,10 +23,10 @@ import org.robolectric.annotation.Config
 class ExampleRobolectricTest {
 
     @Test
-    fun `app name matches StreamVault`() {
+    fun `app name matches ArfStream`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val appName = context.getString(R.string.app_name)
-        assertEquals("StreamVault", appName)
+        assertEquals("ArfStream", appName)
     }
 
     @Test
@@ -85,17 +85,46 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `stripCloakedTsPrefix strips fake PNG prefix before MPEG-TS sync byte`() {
+    fun `stripCloakedTsPrefix strips small and large fake prefixes while preserving fMP4`() {
         val fakePngPrefix = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
-        val tsPayload = ByteArray(376) { 0x11 }
+        val tsPayload = ByteArray(564) { 0x11 }
         tsPayload[0] = 0x47
         tsPayload[188] = 0x47
+        tsPayload[376] = 0x47
         val cloaked = fakePngPrefix + tsPayload
 
         val cleaned = StreamDownloader.stripCloakedTsPrefix(cloaked)
-        assertEquals(376, cleaned.size)
+        assertEquals(564, cleaned.size)
         assertEquals(0x47.toByte(), cleaned[0])
         assertEquals(0x47.toByte(), cleaned[188])
+
+        // Larger fake image header (> 8 KB) should also be stripped cleanly
+        val largeFakePrefix = ByteArray(10240) { 0x22 }
+        val largeCloaked = largeFakePrefix + tsPayload
+        val cleanedLarge = StreamDownloader.stripCloakedTsPrefix(largeCloaked)
+        assertEquals(564, cleanedLarge.size)
+        assertEquals(0x47.toByte(), cleanedLarge[0])
+
+        // Valid fMP4 segment must never be stripped
+        val fmp4 = ByteArray(600) { 0x00 }
+        fmp4[4] = 'f'.code.toByte()
+        fmp4[5] = 't'.code.toByte()
+        fmp4[6] = 'y'.code.toByte()
+        fmp4[7] = 'p'.code.toByte()
+        fmp4[10] = 0x47
+        fmp4[198] = 0x47
+        fmp4[386] = 0x47
+        val preservedFmp4 = StreamDownloader.stripCloakedTsPrefix(fmp4)
+        assertEquals(600, preservedFmp4.size)
+    }
+
+    @Test
+    fun `decodeDataUriKey decodes inline base64 AES-128 key`() {
+        // 16 zero bytes in base64 -> "AAAAAAAAAAAAAAAAAAAAAA=="
+        val decoded = StreamDownloader.decodeDataUriKey("data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAAAAAA==")
+        assertNotNull(decoded)
+        assertEquals(16, decoded!!.size)
+        assertNull(StreamDownloader.decodeDataUriKey("https://cdn.example.com/key.bin"))
     }
 
     @Test
@@ -310,5 +339,87 @@ class ExampleRobolectricTest {
         assertNull(com.example.browser.VideoThumbnailLoader.decodeBase64DataUrl(""))
         assertNull(com.example.browser.VideoThumbnailLoader.decodeBase64DataUrl("https://example.com/poster.jpg"))
         assertNull(com.example.browser.VideoThumbnailLoader.decodeBase64DataUrl("data:image/jpeg;base64,"))
+    }
+
+    @Test
+    fun `tabSessionSerializer round-trips multi-tab session and handles invalid json`() {
+        val original = com.example.data.local.SavedTabSession(
+            activeTabId = "tab-2",
+            tabs = listOf(
+                com.example.data.local.SavedTabRecord(
+                    id = "tab-1",
+                    url = "https://archive.org/details/movies",
+                    title = "Internet Archive",
+                    isHomeScreen = false,
+                    isDesktopMode = false,
+                    scrollY = 420
+                ),
+                com.example.data.local.SavedTabRecord(
+                    id = "tab-2",
+                    url = "https://vimeo.com/channels/staffpicks",
+                    title = "Vimeo Staff Picks",
+                    isHomeScreen = false,
+                    isDesktopMode = true,
+                    scrollY = 1280
+                )
+            )
+        )
+        val json = com.example.data.local.TabSessionSerializer.serialize(original)
+        val restored = com.example.data.local.TabSessionSerializer.deserialize(json)
+        assertNotNull(restored)
+        assertEquals("tab-2", restored!!.activeTabId)
+        assertEquals(2, restored.tabs.size)
+        assertEquals("https://archive.org/details/movies", restored.tabs[0].url)
+        assertEquals(420, restored.tabs[0].scrollY)
+        assertTrue(restored.tabs[1].isDesktopMode)
+        assertEquals(1280, restored.tabs[1].scrollY)
+
+        assertNull(com.example.data.local.TabSessionSerializer.deserialize(null))
+        assertNull(com.example.data.local.TabSessionSerializer.deserialize("{not valid json"))
+    }
+
+    @Test
+    fun `video detection only accepts media from the active tab`() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val vm = com.example.ui.MainViewModel(app)
+        val tab1Id = vm.activeTabId.value
+        vm.createNewTab()
+        val tab2Id = vm.activeTabId.value
+        assertFalse(tab1Id == tab2Id)
+
+        // Attempt to report media from inactive tab 1 -> MUST be ignored
+        vm.onMediaSniffed(
+            tabId = tab1Id,
+            url = "https://cdn.example.com/inactive_video.mp4",
+            rawTitle = "Inactive Video",
+            mimeHint = "video/mp4",
+            resolution = "720p",
+            durationSeconds = 60,
+            referer = "https://example.com",
+            originHeader = "",
+            userAgent = "UA",
+            cookie = "",
+            origin = "Network"
+        )
+        val tab1After = vm.tabs.value.first { it.id == tab1Id }
+        assertTrue(tab1After.detectedMedia.isEmpty())
+
+        // Report media from active tab 2 -> MUST be accepted
+        vm.onMediaSniffed(
+            tabId = tab2Id,
+            url = "https://cdn.example.com/active_stream.m3u8",
+            rawTitle = "Active Stream",
+            mimeHint = "application/vnd.apple.mpegurl",
+            resolution = "1080p",
+            durationSeconds = 120,
+            referer = "https://example.com",
+            originHeader = "",
+            userAgent = "UA",
+            cookie = "",
+            origin = "Network"
+        )
+        val tab2After = vm.tabs.value.first { it.id == tab2Id }
+        assertEquals(1, tab2After.detectedMedia.size)
+        assertEquals("https://cdn.example.com/active_stream.m3u8", tab2After.detectedMedia[0].url)
     }
 }

@@ -22,6 +22,6 @@ dependencyResolutionManagement {
   }
 }
 
-rootProject.name = "StreamVault"
+rootProject.name = "ArfStream"
 
 include(":app")
